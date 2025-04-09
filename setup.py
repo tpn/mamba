@@ -257,6 +257,25 @@ if not SKIP_CUDA_BUILD:
         )
     )
 
+    ext_modules.append(
+        CUDAExtension(
+            name="selective_scan2_cuda",
+            sources=[
+                "csrc/selective_scan2/selective_scan2.cpp",
+                "csrc/selective_scan2/selective_scan2_fwd_fp32.cu",
+                "csrc/selective_scan2/selective_scan2_fwd_fp16.cu",
+                "csrc/selective_scan2/selective_scan2_fwd_bf16.cu",
+                "csrc/selective_scan2/selective_scan2_bwd_fp32_real.cu",
+                "csrc/selective_scan2/selective_scan2_bwd_fp32_complex.cu",
+                "csrc/selective_scan2/selective_scan2_bwd_fp16_real.cu",
+                "csrc/selective_scan2/selective_scan2_bwd_fp16_complex.cu",
+                "csrc/selective_scan2/selective_scan2_bwd_bf16_real.cu",
+                "csrc/selective_scan2/selective_scan2_bwd_bf16_complex.cu",
+            ],
+            extra_compile_args=extra_compile_args,
+            include_dirs=[Path(this_dir) / "csrc" / "selective_scan2"],
+        )
+    )
 
 def get_package_version():
     with open(Path(this_dir) / PACKAGE_NAME / "__init__.py", "r") as f:
