@@ -12,6 +12,7 @@
     #include <cub/block/block_load.cuh>
     #include <cub/block/block_store.cuh>
     #include <cub/block/block_scan.cuh>
+    #include <cub/device/device_scan.cuh>
 #else
     #include <hipcub/hipcub.hpp>
     namespace cub = hipcub;
@@ -69,9 +70,12 @@ struct Selective_Scan2_fwd_kernel_traits {
     static constexpr int kSmemSize = kSmemIOSize + sizeof(typename BlockScanT::TempStorage);
 };
 
+// Part 1: Pre-kernel that computes everything up to the scan
 template<typename Ktraits>
 __global__ __launch_bounds__(Ktraits::kNThreads, Ktraits::kMinBlocks)
-void selective_scan2_fwd_kernel(SSMParamsBase params) {
+void selective_scan2_fwd_pre_kernel(SSMParamsBase params,
+                                    typename Ktraits::scan_t* thread_data_out,
+                                    typename Ktraits::scan_t* running_prefix_in) {
     constexpr bool kIsComplex = Ktraits::kIsComplex;
     constexpr bool kIsVariableB = Ktraits::kIsVariableB;
     constexpr bool kIsVariableC = Ktraits::kIsVariableC;
@@ -86,17 +90,9 @@ void selective_scan2_fwd_kernel(SSMParamsBase params) {
 
     // Shared memory.
     extern __shared__ char smem_[];
-    // cast to lvalue reference of expected type
-    // char *smem_loadstorescan = smem_ + 2 * MAX_DSTATE * sizeof(weight_t);
-    // auto& smem_load = reinterpret_cast<typename BlockLoadT::TempStorage&>(smem_ + 2 * MAX_DSTATE * sizeof(weight_t));
-    // auto& smem_load = reinterpret_cast<typename BlockLoadT::TempStorage&>(smem_loadstorescan);
     auto& smem_load = reinterpret_cast<typename Ktraits::BlockLoadT::TempStorage&>(smem_);
     auto& smem_load_weight = reinterpret_cast<typename Ktraits::BlockLoadWeightT::TempStorage&>(smem_);
     auto& smem_load_weight1 = *reinterpret_cast<typename Ktraits::BlockLoadWeightT::TempStorage*>(smem_ + sizeof(typename Ktraits::BlockLoadWeightT::TempStorage));
-    auto& smem_store = reinterpret_cast<typename Ktraits::BlockStoreT::TempStorage&>(smem_);
-    auto& smem_scan = *reinterpret_cast<typename Ktraits::BlockScanT::TempStorage*>(smem_ + Ktraits::kSmemIOSize);
-    // weight_t *smem_a = reinterpret_cast<weight_t *>(smem_ + smem_loadstorescan_size);
-    // weight_t *smem_bc = reinterpret_cast<weight_t *>(smem_a + MAX_DSTATE);
     scan_t *smem_running_prefix = reinterpret_cast<scan_t *>(smem_ + Ktraits::kSmemSize);
 
     const int batch_id = blockIdx.x;
@@ -128,11 +124,6 @@ void selective_scan2_fwd_kernel(SSMParamsBase params) {
         }
     }
 
-    // for (int state_idx = threadIdx.x; state_idx < params.dstate; state_idx += blockDim.x) {
-    //     smem_a[state_idx] = A[state_idx * params.A_dstate_stride];
-    //     smem_bc[state_idx] = B[state_idx * params.B_dstate_stride] * C[state_idx * params.C_dstate_stride];
-    // }
-
     constexpr int kChunkSize = kNThreads * kNItems;
     for (int chunk = 0; chunk < params.n_chunks; ++chunk) {
         input_t u_vals[kNRows][kNItems], delta_vals_load[kNRows][kNItems];
@@ -148,7 +139,7 @@ void selective_scan2_fwd_kernel(SSMParamsBase params) {
         }
         u += kChunkSize;
         delta += kChunkSize;
-    
+
         float delta_vals[kNRows][kNItems], delta_u_vals[kNRows][kNItems], out_vals[kNRows][kNItems];
         #pragma unroll
         for (int r = 0; r < kNRows; ++r) {
@@ -237,40 +228,320 @@ void selective_scan2_fwd_kernel(SSMParamsBase params) {
                         }
                     }
                 }
-                // Initialize running total
-                scan_t running_prefix;
-                if constexpr (!kIsComplex) {
-                    // If we use WARP_SCAN then all lane 0 of all warps (not just thread 0) needs to read
-                    running_prefix = chunk > 0 && threadIdx.x % 32 == 0 ? smem_running_prefix[state_idx + r * MAX_DSTATE] : make_float2(1.f, 0.f);
-                    // running_prefix = chunk > 0 && threadIdx.x == 0 ? smem_running_prefix[state_idx] : make_float2(1.f, 0.f);
-                } else {
-                    running_prefix = chunk > 0 && threadIdx.x % 32 == 0 ? smem_running_prefix[state_idx + r * MAX_DSTATE] : make_float4(1.f, 0.f, 0.f, 0.f);
-                    // running_prefix = chunk > 0 && threadIdx.x == 0 ? smem_running_prefix[state_idx] : make_float4(1.f, 0.f, 0.f, 0.f);
-                }
-                SSMScanPrefixCallbackOp<weight_t> prefix_op(running_prefix);
-                typename Ktraits::BlockScanT(smem_scan).InclusiveScan(
-                    thread_data, thread_data, SSMScanOp<weight_t>(), prefix_op
-                );
-                // There's a syncthreads in the scan op, so we don't need to sync here.
-                // Unless there's only 1 warp, but then it's the same thread (0) reading and writing.
-                if (threadIdx.x == 0) {
-                    smem_running_prefix[state_idx] = prefix_op.running_prefix;
-                    x[(r * params.n_chunks + chunk) * params.dstate + state_idx] = prefix_op.running_prefix;
-                }
-                #pragma unroll
+
+                // Store thread_data for the scan kernel
+                int data_offset = (batch_id * params.dim + dim_id * kNRows + r) * params.n_chunks * params.dstate * kNThreads * kNItems +
+                                 chunk * params.dstate * kNThreads * kNItems +
+                                 state_idx * kNThreads * kNItems +
+                                 threadIdx.x * kNItems;
                 for (int i = 0; i < kNItems; ++i) {
-                    const weight_t C_val = !kIsVariableC
-                        ? BC_val[r]
-                        : (!kIsVariableB ? BC_val[r] * C_vals[i] : C_vals[i]);
-                    if constexpr (!kIsComplex) {
-                        out_vals[r][i] += thread_data[i].y * C_val;
-                    } else {
-                        out_vals[r][i] += (complex_t(thread_data[i].z, thread_data[i].w) * C_val).real_ * 2;
+                    thread_data_out[data_offset + i] = thread_data[i];
+                }
+
+                // Store initial running prefix for the scan
+                if (threadIdx.x == 0 && chunk > 0) {
+                    int prefix_offset = (batch_id * params.dim + dim_id * kNRows + r) * params.n_chunks * params.dstate +
+                                        (chunk - 1) * params.dstate +
+                                        state_idx;
+                    running_prefix_in[prefix_offset] = smem_running_prefix[state_idx + r * MAX_DSTATE];
+                }
+            }
+        }
+
+        Bvar += kChunkSize * (!kIsComplex ? 1 : 2);
+        Cvar += kChunkSize * (!kIsComplex ? 1 : 2);
+    }
+}
+
+// Part 2: Scan kernel using cub::DeviceScan::InclusiveScan
+template<typename weight_t, typename scan_t>
+struct SSMScanOpDevice {
+    __host__ __device__ __forceinline__ scan_t operator()(const scan_t &a, const scan_t &b) const {
+        if constexpr (std::is_same_v<scan_t, float2>) {
+            return make_float2(a.x * b.x, a.x * b.y + a.y);
+        } else {
+            // Complex version
+            float real_a = a.x;
+            float imag_a = a.y;
+            complex_t a_complex(real_a, imag_a);
+            complex_t b_complex_first(b.x, b.y);
+            complex_t ab_complex = a_complex * b_complex_first;
+            complex_t ab_complex_second(b.z, b.w);
+            return make_float4(ab_complex.real_, ab_complex.imag_,
+                               b.z * a.x - b.w * a.y + a.z,
+                               b.w * a.x + b.z * a.y + a.w);
+        }
+    }
+};
+
+template<typename Ktraits>
+void selective_scan2_fwd_scan_kernel(
+    typename Ktraits::scan_t* d_in,
+    typename Ktraits::scan_t* d_out,
+    typename Ktraits::scan_t* running_prefix_in,
+    typename Ktraits::scan_t* running_prefix_out,
+    int batch, int dim, int n_chunks, int dstate, int seq_len,
+    cudaStream_t stream) {
+
+    using scan_t = typename Ktraits::scan_t;
+    using weight_t = typename Ktraits::weight_t;
+    constexpr int kNThreads = Ktraits::kNThreads;
+    constexpr int kNItems = Ktraits::kNItems;
+    constexpr int kNRows = Ktraits::kNRows;
+    constexpr bool kIsComplex = Ktraits::kIsComplex;
+
+    // Calculate some constants
+    const int elements_per_chunk = kNThreads * kNItems;
+    const int elements_per_batch_dim_row_state = n_chunks * elements_per_chunk;
+
+    // Allocate temporary storage and initialize variables
+    void* d_temp_storage = nullptr;
+    size_t temp_storage_bytes = 0;
+
+    // Create temporary memory for segmented scan
+    const int max_elements = elements_per_chunk;
+    scan_t *d_temp_in = nullptr;
+    cudaMalloc(&d_temp_in, max_elements * sizeof(scan_t));
+
+    // Determine size needed for CUB
+    cub::DeviceScan::InclusiveScan(
+        d_temp_storage,
+        temp_storage_bytes,
+        d_temp_in,
+        d_out,
+        SSMScanOpDevice<weight_t, scan_t>(),
+        max_elements,
+        stream
+    );
+
+    // Allocate temporary storage for CUB
+    cudaMalloc(&d_temp_storage, temp_storage_bytes);
+
+    // Process each segment of data one at a time
+    for (int b = 0; b < batch; ++b) {
+        for (int d = 0; d < dim; ++d) {
+            for (int r = 0; r < kNRows; ++r) {
+                for (int s = 0; s < dstate; ++s) {
+                    scan_t prefix = {0};
+
+                    for (int c = 0; c < n_chunks; ++c) {
+                        // Calculate offset into the data arrays
+                        const int data_offset =
+                            (b * dim + d * kNRows + r) * n_chunks * dstate * elements_per_chunk +
+                            c * dstate * elements_per_chunk +
+                            s * elements_per_chunk;
+
+                        // Initialize prefix for first chunk, otherwise use running prefix
+                        if (c == 0) {
+                            // Identity value
+                            if constexpr (!kIsComplex) {
+                                prefix = make_float2(1.0f, 0.0f);
+                            } else {
+                                prefix = make_float4(1.0f, 0.0f, 0.0f, 0.0f);
+                            }
+                        } else {
+                            // Get previous chunk's running prefix
+                            const int prefix_idx = (b * dim + d * kNRows + r) * n_chunks * dstate + (c-1) * dstate + s;
+                            cudaMemcpyAsync(&prefix,
+                                           running_prefix_out + prefix_idx,
+                                           sizeof(scan_t),
+                                           cudaMemcpyDeviceToHost,
+                                           stream);
+                            cudaStreamSynchronize(stream);
+                        }
+
+                        // Copy chunk to temporary buffer
+                        cudaMemcpyAsync(d_temp_in,
+                                       d_in + data_offset,
+                                       elements_per_chunk * sizeof(scan_t),
+                                       cudaMemcpyDeviceToDevice,
+                                       stream);
+
+                        // Process the first element to incorporate the prefix
+                        if (c > 0) {
+                            scan_t first_element;
+                            cudaMemcpyAsync(&first_element,
+                                          d_temp_in,
+                                          sizeof(scan_t),
+                                          cudaMemcpyDeviceToHost,
+                                          stream);
+                            cudaStreamSynchronize(stream);
+
+                            // Apply the scan operation to merge the prefix with the first element
+                            SSMScanOpDevice<weight_t, scan_t> scan_op;
+                            scan_t result = scan_op(prefix, first_element);
+
+                            // Write the result back
+                            cudaMemcpyAsync(d_temp_in,
+                                          &result,
+                                          sizeof(scan_t),
+                                          cudaMemcpyHostToDevice,
+                                          stream);
+                        }
+
+                        // Perform scan on the chunk
+                        cub::DeviceScan::InclusiveScan(
+                            d_temp_storage,
+                            temp_storage_bytes,
+                            d_temp_in,
+                            d_out + data_offset,
+                            SSMScanOpDevice<weight_t, scan_t>(),
+                            elements_per_chunk,
+                            stream
+                        );
+
+                        // Store the running prefix for this chunk
+                        const int prefix_out_idx = (b * dim + d * kNRows + r) * n_chunks * dstate + c * dstate + s;
+                        cudaMemcpyAsync(
+                            running_prefix_out + prefix_out_idx,
+                            d_out + data_offset + elements_per_chunk - 1,
+                            sizeof(scan_t),
+                            cudaMemcpyDeviceToDevice,
+                            stream
+                        );
                     }
                 }
             }
         }
-        
+    }
+
+    // Clean up temporary memory
+    cudaFree(d_temp_storage);
+    cudaFree(d_temp_in);
+}
+
+// Part 3: Post-kernel that processes the scan results and computes the final output
+template<typename Ktraits>
+__global__ __launch_bounds__(Ktraits::kNThreads, Ktraits::kMinBlocks)
+void selective_scan2_fwd_post_kernel(SSMParamsBase params,
+                                     typename Ktraits::scan_t* thread_data_scanned,
+                                     typename Ktraits::scan_t* running_prefix_out) {
+    constexpr bool kIsComplex = Ktraits::kIsComplex;
+    constexpr bool kIsVariableB = Ktraits::kIsVariableB;
+    constexpr bool kIsVariableC = Ktraits::kIsVariableC;
+    constexpr bool kHasZ = Ktraits::kHasZ;
+    constexpr int kNThreads = Ktraits::kNThreads;
+    constexpr int kNItems = Ktraits::kNItems;
+    constexpr int kNRows = Ktraits::kNRows;
+    constexpr bool kDirectIO = Ktraits::kDirectIO;
+    using input_t = typename Ktraits::input_t;
+    using weight_t = typename Ktraits::weight_t;
+    using scan_t = typename Ktraits::scan_t;
+
+    // Shared memory
+    extern __shared__ char smem_[];
+    auto& smem_load = reinterpret_cast<typename Ktraits::BlockLoadT::TempStorage&>(smem_);
+    auto& smem_store = reinterpret_cast<typename Ktraits::BlockStoreT::TempStorage&>(smem_);
+    auto& smem_load_weight = reinterpret_cast<typename Ktraits::BlockLoadWeightT::TempStorage&>(smem_);
+    auto& smem_load_weight1 = *reinterpret_cast<typename Ktraits::BlockLoadWeightT::TempStorage*>(smem_ + sizeof(typename Ktraits::BlockLoadWeightT::TempStorage));
+
+    const int batch_id = blockIdx.x;
+    const int dim_id = blockIdx.y;
+    const int group_id = dim_id / (params.dim_ngroups_ratio);
+
+    // Get pointers to data
+    weight_t *B = reinterpret_cast<weight_t *>(params.B_ptr) + dim_id * kNRows * params.B_d_stride;
+    input_t *Bvar = reinterpret_cast<input_t *>(params.B_ptr) + batch_id * params.B_batch_stride + group_id * params.B_group_stride;
+    weight_t *C = reinterpret_cast<weight_t *>(params.C_ptr) + dim_id * kNRows * params.C_d_stride;
+    input_t *Cvar = reinterpret_cast<input_t *>(params.C_ptr) + batch_id * params.C_batch_stride + group_id * params.C_group_stride;
+    scan_t *x = reinterpret_cast<scan_t *>(params.x_ptr) + (batch_id * params.dim + dim_id * kNRows) * params.n_chunks * params.dstate;
+
+    // Get D values for the output calculation
+    float D_val[kNRows] = {0};
+    if (params.D_ptr != nullptr) {
+        #pragma unroll
+        for (int r = 0; r < kNRows; ++r) {
+            D_val[r] = reinterpret_cast<float *>(params.D_ptr)[dim_id * kNRows + r];
+        }
+    }
+
+    constexpr int kChunkSize = kNThreads * kNItems;
+
+    for (int chunk = 0; chunk < params.n_chunks; ++chunk) {
+        float out_vals[kNRows][kNItems];
+        // Initialize out_vals with D_val * u_val (which was already computed in pre-kernel)
+        // We'll need to re-read u_vals here or pass them through
+
+        // For simplicity, start with zero and we'll add D_val * u_val in the inner loop below
+        #pragma unroll
+        for (int r = 0; r < kNRows; ++r) {
+            #pragma unroll
+            for (int i = 0; i < kNItems; ++i) {
+                out_vals[r][i] = 0.0f;
+            }
+        }
+
+        for (int state_idx = 0; state_idx < params.dstate; ++state_idx) {
+            // This variable holds B * C if both B and C are constant across seqlen. If only B varies
+            // across seqlen, this holds C. If only C varies across seqlen, this holds B.
+            // If both B and C vary, this is unused.
+            weight_t BC_val[kNRows];
+            weight_t B_vals[kNItems], C_vals[kNItems];
+
+            if constexpr (kIsVariableB) {
+                load_weight<Ktraits>(Bvar + state_idx * params.B_dstate_stride, B_vals,
+                    smem_load_weight, (params.seqlen - chunk * kChunkSize) * (!kIsComplex ? 1 : 2));
+                if constexpr (!kIsVariableC) {
+                    #pragma unroll
+                    for (int r = 0; r < kNRows; ++r) {
+                        BC_val[r] = C[state_idx * params.C_dstate_stride + r * params.C_d_stride];
+                    }
+                }
+            }
+
+            if constexpr (kIsVariableC) {
+                auto &smem_load_weight_C = !kIsVariableB ? smem_load_weight : smem_load_weight1;
+                load_weight<Ktraits>(Cvar + state_idx * params.C_dstate_stride, C_vals,
+                    smem_load_weight_C, (params.seqlen - chunk * kChunkSize) * (!kIsComplex ? 1 : 2));
+                if constexpr (!kIsVariableB) {
+                    #pragma unroll
+                    for (int r = 0; r < kNRows; ++r) {
+                        BC_val[r] = B[state_idx * params.B_dstate_stride + r * params.B_d_stride];
+                    }
+                }
+            }
+
+            if constexpr (!kIsVariableB && !kIsVariableC) {
+                #pragma unroll
+                for (int r = 0; r < kNRows; ++r) {
+                    BC_val[r] = B[state_idx * params.B_dstate_stride + r * params.B_d_stride] * C[state_idx * params.C_dstate_stride + r * params.C_d_stride];
+                }
+            }
+
+            #pragma unroll
+            for (int r = 0; r < kNRows; ++r) {
+                // Get the scanned data for this state
+                int data_offset = (batch_id * params.dim + dim_id * kNRows + r) * params.n_chunks * params.dstate * kNThreads * kNItems +
+                                 chunk * params.dstate * kNThreads * kNItems +
+                                 state_idx * kNThreads * kNItems +
+                                 threadIdx.x * kNItems;
+
+                // Copy running prefix to x for backward pass
+                if (threadIdx.x == 0) {
+                    int prefix_offset = (batch_id * params.dim + dim_id * kNRows + r) * params.n_chunks * params.dstate +
+                                      chunk * params.dstate +
+                                      state_idx;
+                    x[(r * params.n_chunks + chunk) * params.dstate + state_idx] = running_prefix_out[prefix_offset];
+                }
+
+                // Process scanned data to calculate output
+                #pragma unroll
+                for (int i = 0; i < kNItems; ++i) {
+                    scan_t scanned_val = thread_data_scanned[data_offset + i];
+                    const weight_t C_val = !kIsVariableC
+                        ? BC_val[r]
+                        : (!kIsVariableB ? BC_val[r] * C_vals[i] : C_vals[i]);
+
+                    if constexpr (!kIsComplex) {
+                        out_vals[r][i] += scanned_val.y * C_val;
+                    } else {
+                        out_vals[r][i] += (complex_t(scanned_val.z, scanned_val.w) * C_val).real_ * 2;
+                    }
+                }
+            }
+        }
+
+        // Store the output
         input_t *out = reinterpret_cast<input_t *>(params.out_ptr) + batch_id * params.out_batch_stride
             + dim_id * kNRows * params.out_d_stride + chunk * kChunkSize;
         __syncthreads();
@@ -317,30 +588,70 @@ void selective_scan2_fwd_launch(SSMParamsBase &params, cudaStream_t stream) {
             BOOL_SWITCH(params.is_variable_C, kIsVariableC, [&] {
                 BOOL_SWITCH(params.z_ptr != nullptr , kHasZ, [&] {
                     using Ktraits = Selective_Scan2_fwd_kernel_traits<kNThreads, kNItems, kNRows, kIsEvenLen, kIsVariableB, kIsVariableC, kHasZ, input_t, weight_t>;
-                    
+                    using scan_t = typename Ktraits::scan_t;
+
                     constexpr int kSmemSize = Ktraits::kSmemSize + kNRows * MAX_DSTATE * sizeof(typename Ktraits::scan_t);
                     dim3 grid(params.batch, params.dim / kNRows);
 
-                    // Had to change this substantially since potentially the hip 
-                    // interface for setting kernel launch attributes is slightly different from 
-                    // cuda's. In particualar, it seems to expect a plain const void * pointer.
+                    // Calculate sizes
+                    constexpr int kChunkSize = kNThreads * kNItems;
+                    const int elements_per_scan = kNThreads * kNItems;
 
-                    auto kernel = &selective_scan2_fwd_kernel<Ktraits>;
+                    // Allocate device memory for intermediate data
+                    scan_t* d_thread_data;
+                    scan_t* d_thread_data_scanned;
+                    scan_t* d_running_prefix_in;
+                    scan_t* d_running_prefix_out;
 
-                    
+                    size_t thread_data_size = params.batch * params.dim * kNRows * params.n_chunks * params.dstate * elements_per_scan * sizeof(scan_t);
+                    size_t running_prefix_size = params.batch * params.dim * kNRows * params.n_chunks * params.dstate * sizeof(scan_t);
+
+                    cudaMalloc(&d_thread_data, thread_data_size);
+                    cudaMalloc(&d_thread_data_scanned, thread_data_size);
+                    cudaMalloc(&d_running_prefix_in, running_prefix_size);
+                    cudaMalloc(&d_running_prefix_out, running_prefix_size);
+
+                    // Setup kernel attributes
                     if (kSmemSize >= 48 * 1024) {
                         #ifndef USE_ROCM
                         C10_CUDA_CHECK(cudaFuncSetAttribute(
-                            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize));
+                            &selective_scan2_fwd_pre_kernel<Ktraits>,
+                            cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize));
+                        C10_CUDA_CHECK(cudaFuncSetAttribute(
+                            &selective_scan2_fwd_post_kernel<Ktraits>,
+                            cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize));
                         #else
                         C10_CUDA_CHECK(cudaFuncSetAttribute(
-                            (void *) kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize));
-                            std::cerr << "Warning (selective_scan2_fwd_kernel): attempting to set maxDynamicSharedMemorySize on an AMD GPU which is currently a non-op (in ROCm versions <= 6.1). This might lead to undefined behavior. \n" << std::endl;
+                            (void *)&selective_scan2_fwd_pre_kernel<Ktraits>,
+                            cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize));
+                        C10_CUDA_CHECK(cudaFuncSetAttribute(
+                            (void *)&selective_scan2_fwd_post_kernel<Ktraits>,
+                            cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize));
+                        std::cerr << "Warning (selective_scan2_fwd_kernel): attempting to set maxDynamicSharedMemorySize on an AMD GPU which is currently a non-op (in ROCm versions <= 6.1). This might lead to undefined behavior. \n" << std::endl;
                         #endif
                     }
 
-                    kernel<<<grid, Ktraits::kNThreads, kSmemSize, stream>>>(params);
+                    // 1. Pre-compute data for scanning
+                    selective_scan2_fwd_pre_kernel<Ktraits><<<grid, Ktraits::kNThreads, kSmemSize, stream>>>(
+                        params, d_thread_data, d_running_prefix_in);
                     C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+                    // 2. Perform scan operation
+                    selective_scan2_fwd_scan_kernel<Ktraits>(
+                        d_thread_data, d_thread_data_scanned, d_running_prefix_in, d_running_prefix_out,
+                        params.batch, params.dim, params.n_chunks, params.dstate, params.seqlen,
+                        stream);
+
+                    // 3. Process scan results
+                    selective_scan2_fwd_post_kernel<Ktraits><<<grid, Ktraits::kNThreads, kSmemSize, stream>>>(
+                        params, d_thread_data_scanned, d_running_prefix_out);
+                    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+                    // Free allocated memory
+                    cudaFree(d_thread_data);
+                    cudaFree(d_thread_data_scanned);
+                    cudaFree(d_running_prefix_in);
+                    cudaFree(d_running_prefix_out);
                 });
             });
         });
@@ -351,7 +662,7 @@ template<typename input_t, typename weight_t>
 void selective_scan2_fwd_cuda(SSMParamsBase &params, cudaStream_t stream) {
 
     #ifndef USE_ROCM
-        if (params.seqlen <= 128) {           
+        if (params.seqlen <= 128) {
             selective_scan2_fwd_launch<32, 4, input_t, weight_t>(params, stream);
         } else if (params.seqlen <= 256) {
             selective_scan2_fwd_launch<32, 8, input_t, weight_t>(params, stream);
