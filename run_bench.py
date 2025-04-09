@@ -41,11 +41,19 @@ def run_realtime(cmd, text_file):
 
 @pytest.mark.parametrize("genlen", [100, 1000, 10000])
 @pytest.mark.parametrize("promptlen", [10, 100, 1000])
-@pytest.mark.parametrize("batch", [1, 4, 8, 16, 32, 64])
+@pytest.mark.parametrize("batch", [1, 4, 8, 16, 32, 64, 128, 256])
 def test_nsys_profile(promptlen, genlen, batch):
     # Skip if promptlen > genlen.
-    if promptlen > genlen:
+    if promptlen >= genlen:
         pytest.skip("Skipping test where promptlen > genlen.")
+
+    # We've already captured a promptlen=1000 && genlen=10000 instance.
+    if promptlen == 1000 and genlen == 10000:
+        pytest.skip("Skipping promptlen == 1000 and genlen = 10000")
+
+    # Skip batch sizes greater than 64 if genlen >= 10000.
+    if batch > 64 and genlen >= 10000:
+        pytest.skip("Skipping batch size greater than 64 if genlen >= 10000")
 
     # Obtain a yyyy-mm-dd-hh-mm-ss timestamp using Python.
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
