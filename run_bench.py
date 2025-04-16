@@ -30,40 +30,47 @@ def run_realtime(cmd, text_file):
         bufsize=1
     )
 
+    prefix = text_file[:-4]
+    last_line_len = 0
+
     with open(text_file, "w+") as f:
         for line in proc.stdout:
-            print(line, end="")
-            f.write(line)
+            percent_line = (
+                line.startswith('[') and
+                '%' in line and
+                prefix in line
+            )
+            # Use carriage return to move cursor to start of line for percent lines
+            if percent_line:
+                # Move to beginning of line and clear any remaining chars with spaces
+                print(f"\r{line.rstrip()}", end="", flush=True)
+                # If the new line is shorter than the previous one, add spaces to clear
+                if len(line.rstrip()) < last_line_len:
+                    print(" " * (last_line_len - len(line.rstrip())), end="", flush=True)
+                    print("\r" + line.rstrip(), end="", flush=True)
+                last_line_len = len(line.rstrip())
+            else:
+                print(line, end="", flush=True)
+                f.write(line)
+                last_line_len = 0  # Reset last_line_len for non-percent lines
 
     proc.wait()
     if proc.returncode != 0:
         raise subprocess.CalledProcessError(proc.returncode, cmd)
 
+@pytest.mark.parametrize("scan", ['cuda', 'ref'])
 @pytest.mark.parametrize("genlen", [100, 1000, 10000])
 @pytest.mark.parametrize("promptlen", [10, 100, 1000])
 @pytest.mark.parametrize("batch", [1, 4, 8, 16, 32, 64, 128, 256])
-def test_nsys_profile(promptlen, genlen, batch):
-    # Skip if promptlen > genlen.
-    if promptlen >= genlen:
-        pytest.skip("Skipping test where promptlen > genlen.")
-
-    # We've already captured a promptlen=1000 && genlen=10000 instance.
-    if promptlen == 1000 and genlen == 10000:
-        pytest.skip("Skipping promptlen == 1000 and genlen = 10000")
-
-    # Skip batch sizes greater than 64 if genlen >= 10000.
-    if batch > 64 and genlen >= 10000:
-        pytest.skip("Skipping batch size greater than 64 if genlen >= 10000")
-
+def test_nsys_profile(scan, promptlen, genlen, batch):
     # Obtain a yyyy-mm-dd-hh-mm-ss timestamp using Python.
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
 
     out = (f"mamba-bench-{HOST}-{GPU_NAME}-{GPU_RAM}-promptlen{promptlen}-"
-           f"genlen{genlen}-b{batch}-{timestamp}")
+           f"genlen{genlen}-b{batch}-scan-{scan}-{timestamp}")
     text_file = f"{out}.txt"
-    cmd = [
-        "nsys", "profile",
-        f"--output={out}",
+    # Currently unused; copy back in as needed.
+    unused = [
         "--python-sampling=true",
         "--stats=true",
         "--trace=cuda,cudnn,cublas",
@@ -71,14 +78,6 @@ def test_nsys_profile(promptlen, genlen, batch):
         "--python-backtrace=cuda",
         "--sample=cpu",
         "--cuda-memory-usage=true",
-        "python", "benchmarks/benchmark_generation_mamba_simple.py",
-        "--model-name", "state-spaces/mamba-2.8b",
-        "--topp", "0.9",
-        "--temperature", "0.7",
-        "--repetition-penalty", "1.2",
-        "--promptlen", str(promptlen),
-        "--genlen", str(genlen),
-        "--batch", str(batch),
     ]
     cmd = [
         "nsys", "profile",
@@ -95,5 +94,6 @@ def test_nsys_profile(promptlen, genlen, batch):
         "--promptlen", str(promptlen),
         "--genlen", str(genlen),
         "--batch", str(batch),
+        "--scan", scan,
     ]
     run_realtime(cmd, text_file)
