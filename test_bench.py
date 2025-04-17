@@ -1,7 +1,5 @@
-#!/usr/bin/env python3
-import argparse
 import datetime
-import itertools
+import pytest
 import socket
 import subprocess
 
@@ -60,29 +58,32 @@ def run_realtime(cmd, text_file):
     if proc.returncode != 0:
         raise subprocess.CalledProcessError(proc.returncode, cmd)
 
-def run_benchmark(scan, promptlen, genlen, batch, with_nsys=False):
+@pytest.mark.parametrize("scan", ['cuda', 'ref'])
+@pytest.mark.parametrize("genlen", [100, 1000, 10000])
+@pytest.mark.parametrize("promptlen", [10, 100, 1000, 10000])
+@pytest.mark.parametrize("batch", [1, 4, 8, 16, 32, 64, 128, 256])
+def test_nsys_profile_benchmark(scan, promptlen, genlen, batch):
     # Obtain a yyyy-mm-dd-hh-mm-ss timestamp using Python.
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
 
-    prefix = "nsys-mamba-bench" if with_nsys else "mamba-bench"
-    out = (f"{prefix}-{HOST}-{GPU_NAME}-{GPU_RAM}-"
+    out = (f"nsys-mamba-bench-{HOST}-{GPU_NAME}-{GPU_RAM}-"
            f"promptlen{promptlen}-genlen{genlen}-b{batch}-"
            f"scan-{scan}-{timestamp}")
     text_file = f"{out}.txt"
-
-    cmd = []
-
-    if with_nsys:
-        cmd.extend([
-            "nsys", "profile",
-            f"--output={out}",
-            "--stats=true",
-            "--trace=cuda,cudnn,cublas",
-            "--cuda-memory-usage=true",
-            "--gpu-metrics-devices=cuda-visible",
-        ])
-
-    cmd.extend([
+    # Currently unused; copy back in as needed.
+    unused = [
+        "--python-sampling=true",
+        "--cudabacktrace=all",
+        "--python-backtrace=cuda",
+        "--sample=cpu",
+    ]
+    cmd = [
+        "nsys", "profile",
+        f"--output={out}",
+        "--stats=true",
+        "--trace=cuda,cudnn,cublas",
+        "--cuda-memory-usage=true",
+        "--gpu-metrics-devices=cuda-visible",
         "python", "benchmarks/benchmark_generation_mamba_simple.py",
         "--model-name", "state-spaces/mamba-2.8b",
         "--topp", "0.9",
@@ -92,44 +93,31 @@ def run_benchmark(scan, promptlen, genlen, batch, with_nsys=False):
         "--genlen", str(genlen),
         "--batch", str(batch),
         "--scan", scan,
-    ])
-
+    ]
     run_realtime(cmd, text_file)
 
-def parse_comma_separated_values(values_str):
-    return [val.strip() for val in values_str.split(',')]
+@pytest.mark.parametrize("scan", ['cuda', 'ref'])
+@pytest.mark.parametrize("genlen", [100, 1000, 10000])
+@pytest.mark.parametrize("promptlen", [10, 100, 1000, 10000])
+@pytest.mark.parametrize("batch", [1, 4, 8, 16, 32, 64, 128, 256])
+def test_benchmark(scan, promptlen, genlen, batch):
+    # Obtain a yyyy-mm-dd-hh-mm-ss timestamp using Python.
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
 
-def parse_int_list(values_str):
-    return [int(val.strip()) for val in values_str.split(',')]
+    out = (f"mamba-bench-{HOST}-{GPU_NAME}-{GPU_RAM}-"
+           f"promptlen{promptlen}-genlen{genlen}-b{batch}-"
+           f"scan-{scan}-{timestamp}")
+    text_file = f"{out}.txt"
 
-def main():
-    parser = argparse.ArgumentParser(description='Run Mamba benchmarks')
-    parser.add_argument('--scans', type=str, default='cuda,ref',
-                        help='Comma-separated list of scan types (cuda, ref)')
-    parser.add_argument('--promptlens', type=str, default='10,100,1000,10000',
-                        help='Comma-separated list of prompt lengths to benchmark')
-    parser.add_argument('--genlens', type=str, default='100,1000,10000',
-                        help='Comma-separated list of generation lengths to benchmark')
-    parser.add_argument('--batches', type=str, default='1,4,8,16,32,64,128,256',
-                        help='Comma-separated list of batch sizes to benchmark')
-    parser.add_argument('--with-nsys', action='store_true',
-                        help='Run with Nsys profiling')
-
-    args = parser.parse_args()
-
-    # Parse comma-separated values
-    scans = parse_comma_separated_values(args.scans)
-    promptlens = parse_int_list(args.promptlens)
-    genlens = parse_int_list(args.genlens)
-    batches = parse_int_list(args.batches)
-
-    # Create cartesian product of all parameters
-    parameter_combinations = itertools.product(scans, promptlens, genlens, batches)
-
-    # Run benchmarks for all parameter combinations
-    for scan, promptlen, genlen, batch in parameter_combinations:
-        print(f"\nRunning benchmark with: scan={scan}, promptlen={promptlen}, genlen={genlen}, batch={batch}")
-        run_benchmark(scan, promptlen, genlen, batch, with_nsys=args.with_nsys)
-
-if __name__ == "__main__":
-    main()
+    cmd = [
+        "python", "benchmarks/benchmark_generation_mamba_simple.py",
+        "--model-name", "state-spaces/mamba-2.8b",
+        "--topp", "0.9",
+        "--temperature", "0.7",
+        "--repetition-penalty", "1.2",
+        "--promptlen", str(promptlen),
+        "--genlen", str(genlen),
+        "--batch", str(batch),
+        "--scan", scan,
+    ]
+    run_realtime(cmd, text_file)
