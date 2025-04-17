@@ -58,7 +58,8 @@ def run_realtime(cmd, text_file):
 
     proc.wait()
     if proc.returncode != 0:
-        raise subprocess.CalledProcessError(proc.returncode, cmd)
+        print(f"Command failed with return code {proc.returncode}")
+        #raise subprocess.CalledProcessError(proc.returncode, cmd)
 
 def run_benchmark(scan, promptlen, genlen, batch, with_nsys=False):
     # Obtain a yyyy-mm-dd-hh-mm-ss timestamp using Python.
