@@ -60,24 +60,22 @@ def run_realtime(cmd, text_file):
 
 @pytest.mark.parametrize("scan", ['cuda', 'ref'])
 @pytest.mark.parametrize("genlen", [100, 1000, 10000])
-@pytest.mark.parametrize("promptlen", [10, 100, 1000])
+@pytest.mark.parametrize("promptlen", [10, 100, 1000, 10000])
 @pytest.mark.parametrize("batch", [1, 4, 8, 16, 32, 64, 128, 256])
-def test_nsys_profile(scan, promptlen, genlen, batch):
+def test_nsys_profile_benchmark(scan, promptlen, genlen, batch):
     # Obtain a yyyy-mm-dd-hh-mm-ss timestamp using Python.
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
 
-    out = (f"mamba-bench-{HOST}-{GPU_NAME}-{GPU_RAM}-promptlen{promptlen}-"
-           f"genlen{genlen}-b{batch}-scan-{scan}-{timestamp}")
+    out = (f"nsys-mamba-bench-{HOST}-{GPU_NAME}-{GPU_RAM}-"
+           f"promptlen{promptlen}-genlen{genlen}-b{batch}-"
+           f"scan-{scan}-{timestamp}")
     text_file = f"{out}.txt"
     # Currently unused; copy back in as needed.
     unused = [
         "--python-sampling=true",
-        "--stats=true",
-        "--trace=cuda,cudnn,cublas",
         "--cudabacktrace=all",
         "--python-backtrace=cuda",
         "--sample=cpu",
-        "--cuda-memory-usage=true",
     ]
     cmd = [
         "nsys", "profile",
@@ -86,6 +84,32 @@ def test_nsys_profile(scan, promptlen, genlen, batch):
         "--trace=cuda,cudnn,cublas",
         "--cuda-memory-usage=true",
         "--gpu-metrics-devices=cuda-visible",
+        "python", "benchmarks/benchmark_generation_mamba_simple.py",
+        "--model-name", "state-spaces/mamba-2.8b",
+        "--topp", "0.9",
+        "--temperature", "0.7",
+        "--repetition-penalty", "1.2",
+        "--promptlen", str(promptlen),
+        "--genlen", str(genlen),
+        "--batch", str(batch),
+        "--scan", scan,
+    ]
+    run_realtime(cmd, text_file)
+
+@pytest.mark.parametrize("scan", ['cuda', 'ref'])
+@pytest.mark.parametrize("genlen", [100, 1000, 10000])
+@pytest.mark.parametrize("promptlen", [10, 100, 1000, 10000])
+@pytest.mark.parametrize("batch", [1, 4, 8, 16, 32, 64, 128, 256])
+def test_benchmark(scan, promptlen, genlen, batch):
+    # Obtain a yyyy-mm-dd-hh-mm-ss timestamp using Python.
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
+
+    out = (f"mamba-bench-{HOST}-{GPU_NAME}-{GPU_RAM}-"
+           f"promptlen{promptlen}-genlen{genlen}-b{batch}-"
+           f"scan-{scan}-{timestamp}")
+    text_file = f"{out}.txt"
+    
+    cmd = [
         "python", "benchmarks/benchmark_generation_mamba_simple.py",
         "--model-name", "state-spaces/mamba-2.8b",
         "--topp", "0.9",

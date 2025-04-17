@@ -1,8 +1,11 @@
 # Copyright (c) 2023, Tri Dao, Albert Gu.
 
+from textwrap import dedent
+
 import torch
 import torch.nn.functional as F
 from mamba_ssm.utils.torch import custom_bwd, custom_fwd
+import os
 
 from einops import rearrange, repeat
 
@@ -15,14 +18,30 @@ except ImportError:
 
 from mamba_ssm.ops.triton.layer_norm import _layer_norm_fwd
 
-import selective_scan_cuda
+# Get the scan implementation choice from environment variable
+SCAN_OPTION = os.environ.get("MAMBA_SCAN_OPTION", "cuda2")
 
+# Import the appropriate scan implementation based on SCAN_OPTION
+if SCAN_OPTION == "cuda":
+    import selective_scan_cuda
+elif SCAN_OPTION == "cuda2":
+    import selective_scan2_cuda as selective_scan_cuda
+elif SCAN_OPTION == "ref":
+    # For ref option, we'll use the reference implementation at function call sites
+    pass
+else:
+    # Default to cuda2 if an invalid option is provided
+    import selective_scan2_cuda as selective_scan_cuda
 
 class SelectiveScanFn(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, u, delta, A, B, C, D=None, z=None, delta_bias=None, delta_softplus=False,
                 return_last_state=False):
+        if SCAN_OPTION == "ref":
+            # For reference implementation, we don't use this autograd function
+            raise NotImplementedError("Reference implementation doesn't use SelectiveScanFn")
+
         if u.stride(-1) != 1:
             u = u.contiguous()
         if delta.stride(-1) != 1:
@@ -55,6 +74,10 @@ class SelectiveScanFn(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, *args):
+        if SCAN_OPTION == "ref":
+            # For reference implementation, we don't use this autograd function
+            raise NotImplementedError("Reference implementation doesn't use SelectiveScanFn")
+
         if not ctx.has_z:
             u, delta, A, B, C, D, delta_bias, x = ctx.saved_tensors
             z = None
@@ -107,8 +130,12 @@ def selective_scan_fn(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta_
     last_state has shape (batch, dim, dstate). Note that the gradient of the last state is
     not considered in the backward pass.
     """
-    return SelectiveScanFn.apply(u, delta, A, B, C, D, z, delta_bias, delta_softplus, return_last_state)
+    if SCAN_OPTION == "ref":
+        return selective_scan_ref(u, delta, A, B, C, D, z, delta_bias, delta_softplus, return_last_state)
+    else:
+        return SelectiveScanFn.apply(u, delta, A, B, C, D, z, delta_bias, delta_softplus, return_last_state)
 
+SEEN_SCAN_REF = False
 
 def selective_scan_ref(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta_softplus=False,
                       return_last_state=False):
@@ -125,6 +152,26 @@ def selective_scan_ref(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta
     out: r(B D L)
     last_state (optional): r(B D dstate) or c(B D dstate)
     """
+    global SEEN_SCAN_REF
+    if SEEN_SCAN_REF is not True:
+        msg = dedent("""
+            selective_scan_ref(
+                u.shape: {u.shape} (dtype: {u.dtype}),
+                delta.shape: {delta.shape} (dtype: {delta.dtype}),
+                A.shape: {A.shape} (dtype: {A.dtype}),
+                B.shape: {B.shape} (dtype: {B.dtype}),
+                C.shape: {C.shape} (dtype: {C.dtype}),
+                D.shape: {D.shape} (dtype: {D.dtype}),
+                z.shape: {z.shape} (dtype: {z.dtype}),
+                delta_bias.shape: {delta_bias.shape} (dtype: {delta_bias.dtype}),
+                delta_softplus: {delta_softplus},
+                return_last_state: {return_last_state}
+            )
+        """.format(u=u, delta=delta, A=A, B=B, C=C, D=D, z=z,
+                   delta_bias=delta_bias, delta_softplus=delta_softplus,
+                   return_last_state=return_last_state))
+        print(msg)
+        SEEN_SCAN_REF = None
     dtype_in = u.dtype
     u = u.float()
     delta = delta.float()
@@ -157,6 +204,16 @@ def selective_scan_ref(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta
     if is_variable_C and C.dim() == 4:
         C = repeat(C, "B G N L -> B (G H) N L", H=dim // C.shape[1])
     last_state = None
+    if SEEN_SCAN_REF is None:
+        msg = dedent(f'''
+            selective_scan_ref: pre-loop (for i in range({u.shape[2]}))
+                u.shape: {u.shape} (dtype: {u.dtype})
+                deltaA.shape: {deltaA.shape} (dtype: {deltaA.dtype})
+                deltaB_u.shape: {deltaB_u.shape} (dtype: {deltaB_u.dtype})
+                x.shape: {x.shape} (dtype: {x.dtype})
+            ''')
+        print(msg)
+        SEEN_SCAN_REF = -1
     for i in range(u.shape[2]):
         x = deltaA[:, :, i] * x + deltaB_u[:, :, i]
         if not is_variable_C:
@@ -176,6 +233,14 @@ def selective_scan_ref(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta
     if z is not None:
         out = out * F.silu(z)
     out = out.to(dtype=dtype_in)
+    if SEEN_SCAN_REF == -1:
+        msg = dedent(f'''
+            selective_scan_ref: post-loop (for i in range({u.shape[2]}))
+                len(out): {len(out)}
+                len(last_state): {len(last_state)}
+            ''')
+        print(msg)
+        SEEN_SCAN_REF = True
     return out if not return_last_state else (out, last_state)
 
 
@@ -244,7 +309,7 @@ class MambaInnerFn(torch.autograd.Function):
                 C = C.contiguous()
         if D is not None:
             D = D.contiguous()
-            
+
         if b_rms_weight is not None:
             B = rearrange(B, "b 1 dstate l -> (b l) dstate", l=L).contiguous()
             B = rms_norm_forward(B, b_rms_weight, bias=None, eps=b_c_dt_rms_eps)
@@ -257,7 +322,7 @@ class MambaInnerFn(torch.autograd.Function):
             delta = rearrange(delta, "b d l -> (b l) d", l=L).contiguous()
             delta = rms_norm_forward(delta, dt_rms_weight, bias=None, eps=b_c_dt_rms_eps)
             delta = rearrange(delta, "(b l) d -> b d l", l=L).contiguous()
-        
+
         out, scan_intermediates, out_z = selective_scan_cuda.fwd(
             conv1d_out, delta, A, B, C, D, z, delta_bias, delta_softplus
         )
@@ -312,7 +377,7 @@ class MambaInnerFn(torch.autograd.Function):
                     C, ctx.c_rms_weight, None, ctx.b_c_dt_rms_eps
                 )
                 C = rearrange(C, "(b l) dstate -> b 1 dstate l", l=L).contiguous()
-            
+
         # The kernel supports passing in a pre-allocated dz (e.g., in case we want to fuse the
         # backward of selective_scan_cuda with the backward of chunk).
         dxz = torch.empty_like(xz)  # (batch, dim, seqlen)
@@ -374,10 +439,22 @@ def mamba_inner_fn(
     A, B=None, C=None, D=None, delta_bias=None, B_proj_bias=None,
     C_proj_bias=None, delta_softplus=True, checkpoint_lvl=1, b_rms_weight= None, c_rms_weight= None, dt_rms_weight= None, b_c_dt_rms_eps=1e-6
 ):
-    return MambaInnerFn.apply(xz, conv1d_weight, conv1d_bias, x_proj_weight, delta_proj_weight,
-                              out_proj_weight, out_proj_bias,
-                              A, B, C, D, delta_bias, B_proj_bias, C_proj_bias, delta_softplus, checkpoint_lvl, b_rms_weight, c_rms_weight, dt_rms_weight, b_c_dt_rms_eps)
+    if SCAN_OPTION == "ref":
+        return mamba_inner_ref(
+            xz, conv1d_weight, conv1d_bias, x_proj_weight, delta_proj_weight,
+            out_proj_weight, out_proj_bias,
+            A, B, C, D, delta_bias, B_proj_bias,
+            C_proj_bias, delta_softplus
+        )
+    else:
+        return MambaInnerFn.apply(
+            xz, conv1d_weight, conv1d_bias, x_proj_weight, delta_proj_weight,
+            out_proj_weight, out_proj_bias,
+            A, B, C, D, delta_bias, B_proj_bias,
+            C_proj_bias, delta_softplus, checkpoint_lvl, b_rms_weight, c_rms_weight, dt_rms_weight, b_c_dt_rms_eps
+        )
 
+GLOBAL_SEEN_INNER_REF = False
 
 def mamba_inner_ref(
     xz, conv1d_weight, conv1d_bias, x_proj_weight, delta_proj_weight,
@@ -385,6 +462,40 @@ def mamba_inner_ref(
     A, B=None, C=None, D=None, delta_bias=None, B_proj_bias=None,
     C_proj_bias=None, delta_softplus=True
 ):
+    global GLOBAL_SEEN_INNER_REF
+    if not GLOBAL_SEEN_INNER_REF:
+        msg = dedent("""
+            mamba_inner_ref(
+                xz.shape: {xz.shape},
+                conv1d_weight.shape: {conv1d_weight.shape},
+                conv1d_bias.shape: {conv1d_bias.shape},
+                x_proj_weight.shape: {x_proj_weight.shape},
+                delta_proj_weight.shape: {delta_proj_weight.shape},
+                out_proj_weight.shape: {out_proj_weight.shape},
+                out_proj_bias.shape: {out_proj_bias.shape},
+                A.shape: {A.shape},
+                B.shape: {B.shape},
+                C.shape: {C.shape},
+                D.shape: {D.shape},
+                delta_bias.shape: {delta_bias.shape},
+                B_proj_bias.shape: {B_proj_bias.shape},
+                C_proj_bias.shape: {C_proj_bias.shape},
+                delta_softplus: {delta_softplus}
+            )
+        """.format(xz=xz,
+                   conv1d_weight=conv1d_weight,
+                   conv1d_bias=conv1d_bias,
+                   x_proj_weight=x_proj_weight,
+                   delta_proj_weight=delta_proj_weight,
+                   out_proj_weight=out_proj_weight,
+                   out_proj_bias=out_proj_bias,
+                   A=A, B=B, C=C, D=D,
+                   delta_bias=delta_bias,
+                   B_proj_bias=B_proj_bias,
+                   C_proj_bias=C_proj_bias,
+                   delta_softplus=delta_softplus))
+        print(msg)
+        GLOBAL_SEEN_INNER_REF = True
     assert causal_conv1d_fn is not None, "causal_conv1d_fn is not available. Please install causal-conv1d."
     L = xz.shape[-1]
     delta_rank = delta_proj_weight.shape[1]

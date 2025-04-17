@@ -2,6 +2,7 @@
 
 import math
 from typing import Optional
+import os
 
 import torch
 import torch.nn as nn
@@ -10,7 +11,16 @@ from torch import Tensor
 
 from einops import rearrange, repeat
 
-from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, mamba_inner_fn
+# Get the scan implementation choice from environment variable
+SCAN_OPTION = os.environ.get("MAMBA_SCAN_OPTION", "cuda2")
+
+# Import the appropriate scan functions based on SCAN_OPTION
+if SCAN_OPTION == "ref":
+    print(f"Mamba using Python reference scan implementation")
+    from mamba_ssm.ops.selective_scan_interface import selective_scan_ref as selective_scan_fn
+    from mamba_ssm.ops.selective_scan_interface import mamba_inner_ref as mamba_inner_fn
+else:
+    from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, mamba_inner_fn
 
 try:
     from causal_conv1d import causal_conv1d_fn, causal_conv1d_update

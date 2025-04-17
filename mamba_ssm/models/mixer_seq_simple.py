@@ -11,6 +11,10 @@ from collections import namedtuple
 import torch
 import torch.nn as nn
 
+# Print which scan implementation is being used
+scan_option = os.environ.get("MAMBA_SCAN_OPTION", "cuda2")
+print(f"MixerModel using scan implementation: {scan_option}")
+
 from mamba_ssm.models.config_mamba import MambaConfig
 from mamba_ssm.modules.mamba_simple import Mamba
 from mamba_ssm.modules.mamba2 import Mamba2

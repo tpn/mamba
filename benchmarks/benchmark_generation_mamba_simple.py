@@ -3,6 +3,7 @@
 import argparse
 import time
 import json
+import os
 
 import torch
 import torch.nn.functional as F
@@ -11,8 +12,8 @@ from einops import rearrange
 
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
-
+# Define a global variable for SCAN_OPTION to be accessed by imports
+os.environ["MAMBA_SCAN_OPTION"] = "cuda2"  # Default to cuda2
 
 parser = argparse.ArgumentParser(description="Generation benchmarking")
 parser.add_argument("--model-name", type=str, default="state-spaces/mamba-130m")
@@ -25,14 +26,28 @@ parser.add_argument("--topp", type=float, default=1.0)
 parser.add_argument("--minp", type=float, default=0.0)
 parser.add_argument("--repetition-penalty", type=float, default=1.0)
 parser.add_argument("--batch", type=int, default=1)
+parser.add_argument("--scan", type=str, choices=["cuda", "cuda2", "ref"], default="cuda2",
+                    help="Selective scan implementation to use: cuda (selective_scan_cuda), cuda2 (selective_scan2_cuda), or ref (reference implementation)")
 args = parser.parse_args()
+
+# Set the scan option to be used by the imports
+os.environ["MAMBA_SCAN_OPTION"] = args.scan
+
+# Import mamba models after setting the environment variable to ensure it uses the correct implementation
+from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
 
 repeats = 3
 device = "cuda"
 dtype = torch.float16
 
 print(f"Loading model {args.model_name}")
-is_mamba = args.model_name.startswith("state-spaces/mamba") or args.model_name.startswith("state-spaces/transformerpp")
+print(f"Using scan implementation: {args.scan}")
+model_name = args.model_name
+is_mamba = (
+    model_name.startswith("state-spaces/mamba")
+    or model_name.startswith("state-spaces/transformerpp")
+    #or model_name.startswith("tiiuae/falcon-mamba-7b")
+)
 if is_mamba:
     tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")
     model = MambaLMHeadModel.from_pretrained(args.model_name, device=device, dtype=dtype)
