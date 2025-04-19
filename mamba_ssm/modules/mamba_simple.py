@@ -12,15 +12,39 @@ from torch import Tensor
 from einops import rearrange, repeat
 
 # Get the scan implementation choice from environment variable
-SCAN_OPTION = os.environ.get("MAMBA_SCAN_OPTION", "cuda2")
+SCAN_OPTION = os.environ.get("MAMBA_SCAN_OPTION", "cuda")
 
 # Import the appropriate scan functions based on SCAN_OPTION
 if SCAN_OPTION == "ref":
     print(f"Mamba using Python reference scan implementation")
     from mamba_ssm.ops.selective_scan_interface import selective_scan_ref as selective_scan_fn
-    from mamba_ssm.ops.selective_scan_interface import mamba_inner_ref as mamba_inner_fn
+    from mamba_ssm.ops.selective_scan_interface import mamba_inner_fn
+elif SCAN_OPTION == "torch":
+    print(f"Mamba using PyTorch associative scan wrapper implementation")
+    from mamba_ssm.ops.selective_scan_interface import selective_scan_torch as selective_scan_fn
+elif SCAN_OPTION == "torch-cudaparallel":
+    try:
+        from torch._higher_order_ops.cuda_parallel_associative_scan import (
+            associative_scan,
+        )
+    except ImportError:
+        raise RuntimeError("torch._higher_order_ops.cuda_parallel_associative_scan is not available.")
+
+    print(f"Mamba using torch._higher_order_ops.cuda_parallel_associative_scan implementation")
+    from mamba_ssm.ops.selective_scan_interface import selective_scan_torch_cudaparallel as selective_scan_fn
+    from mamba_ssm.ops.selective_scan_interface import mamba_inner_fn
+elif SCAN_OPTION == "cudaparallel":
+    try:
+        import cuda.parallel.experimental.algorithms
+    except ImportError:
+        raise RuntimeError("cuda.parallel.experimental.algorithms is not available.")
+
+    print(f"Mamba using cuda.parallel associative scan implementation (custom)")
+    from mamba_ssm.ops.selective_scan_interface import selective_scan_cudaparallel as selective_scan_fn
+    from mamba_ssm.ops.selective_scan_interface import mamba_inner_fn
 else:
-    from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, mamba_inner_fn
+    from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
+    from mamba_ssm.ops.selective_scan_interface import mamba_inner_fn
 
 try:
     from causal_conv1d import causal_conv1d_fn, causal_conv1d_update

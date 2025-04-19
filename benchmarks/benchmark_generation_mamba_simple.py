@@ -1,9 +1,20 @@
 # Copyright (c) 2023, Tri Dao, Albert Gu.
 
+try:
+    import cuda.parallel.experimental.algorithms
+    print('BENCHMARK: cuda.parallel.experimental.algorithms imported successfully')
+except ImportError:
+    print('BENCHMARK: Error! cuda.parallel.experimental.algorithms not found!')
+
+
 import argparse
 import time
 import json
 import os
+
+# Disable PyTorch compilation/dynamo for better stability
+#os.environ["TORCH_COMPILE_DISABLE"] = "1"
+#os.environ["TORCHDYNAMO_DISABLE"] = "1"
 
 import torch
 import torch.nn.functional as F
@@ -13,10 +24,19 @@ from einops import rearrange
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 # Define a global variable for SCAN_OPTION to be accessed by imports
-os.environ["MAMBA_SCAN_OPTION"] = "cuda2"  # Default to cuda2
+os.environ["MAMBA_SCAN_OPTION"] = "cuda"  # Default to cuda2
+
+SCAN_OPTIONS = [
+    "cuda",
+    "cuda2",
+    "ref",
+    "torch",
+    "torch-cudaparallel",
+    "cudaparallel",
+]
 
 parser = argparse.ArgumentParser(description="Generation benchmarking")
-parser.add_argument("--model-name", type=str, default="state-spaces/mamba-130m")
+parser.add_argument("--model-name", type=str, default="state-spaces/mamba-2.8b")
 parser.add_argument("--prompt", type=str, default=None)
 parser.add_argument("--promptlen", type=int, default=100)
 parser.add_argument("--genlen", type=int, default=100)
@@ -26,8 +46,16 @@ parser.add_argument("--topp", type=float, default=1.0)
 parser.add_argument("--minp", type=float, default=0.0)
 parser.add_argument("--repetition-penalty", type=float, default=1.0)
 parser.add_argument("--batch", type=int, default=1)
-parser.add_argument("--scan", type=str, choices=["cuda", "cuda2", "ref"], default="cuda2",
-                    help="Selective scan implementation to use: cuda (selective_scan_cuda), cuda2 (selective_scan2_cuda), or ref (reference implementation)")
+parser.add_argument("--scan", type=str, choices=SCAN_OPTIONS, default="cuda",
+                    help=(
+                        "Selective scan implementation to use:\n"
+                        "   cuda (selective_scan_cuda),\n"
+                        "   cuda2 (selective_scan2_cuda),\n"
+                        "   ref (reference implementation),\n"
+                        "   torch (pytorch associative scan wrapper),\n"
+                        "   torch-cudaparallel (actual PyTorch associative scan),\n"
+                        "   cudaparallel (cuda.parallel associative scan)\n"
+                    ))
 args = parser.parse_args()
 
 # Set the scan option to be used by the imports

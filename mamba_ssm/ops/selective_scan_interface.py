@@ -7,6 +7,22 @@ import torch.nn.functional as F
 from mamba_ssm.utils.torch import custom_bwd, custom_fwd
 import os
 
+# Disable PyTorch dynamo/compiler to avoid memory issues
+if False:
+    try:
+        import torch._dynamo
+        torch._dynamo.config.suppress_errors = True
+        if hasattr(torch, "_inductor"):
+            torch._inductor.config.triton.cudagraphs = False
+        # Set to 'eager' to disable compilation completely
+        if hasattr(torch, "_dynamo"):
+            torch._dynamo.config.cache_size_limit = 0
+    except ImportError:
+        pass
+
+    # Force high precision for matmul operations
+    torch.set_float32_matmul_precision('high')
+
 from einops import rearrange, repeat
 
 try:
@@ -19,19 +35,39 @@ except ImportError:
 from mamba_ssm.ops.triton.layer_norm import _layer_norm_fwd
 
 # Get the scan implementation choice from environment variable
-SCAN_OPTION = os.environ.get("MAMBA_SCAN_OPTION", "cuda2")
+SCAN_OPTION = os.environ.get("MAMBA_SCAN_OPTION", "cuda")
 
+is_torch_cuda_parallel_available = False
+is_cuda_parallel_available = False
 # Import the appropriate scan implementation based on SCAN_OPTION
 if SCAN_OPTION == "cuda":
     import selective_scan_cuda
 elif SCAN_OPTION == "cuda2":
     import selective_scan2_cuda as selective_scan_cuda
-elif SCAN_OPTION == "ref":
-    # For ref option, we'll use the reference implementation at function call sites
+elif SCAN_OPTION in ["ref"]:
     pass
+elif SCAN_OPTION in ["torch"]:
+    pass
+elif SCAN_OPTION in ["torch-cudaparallel"]:
+    try:
+        from torch._higher_order_ops.cuda_parallel_associative_scan import (
+            associative_scan,
+        )
+        is_torch_cuda_parallel_available = True
+    except ImportError:
+        raise RuntimeError("torch._higher_order_ops.cuda_parallel_associative_scan is not available.")
+elif SCAN_OPTION in ["cudaparallel"]:
+    #import ipdb; ipdb.set_trace()
+    try:
+        import cuda
+        import cuda.parallel
+        import cuda.parallel.experimental
+        import cuda.parallel.experimental.algorithms
+        is_cuda_parallel_available = True
+    except ImportError:
+        raise RuntimeError("cuda.parallel.experimental.algorithms is not available.")
 else:
-    # Default to cuda2 if an invalid option is provided
-    import selective_scan2_cuda as selective_scan_cuda
+    import selective_scan_cuda
 
 class SelectiveScanFn(torch.autograd.Function):
 
@@ -132,10 +168,14 @@ def selective_scan_fn(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta_
     """
     if SCAN_OPTION == "ref":
         return selective_scan_ref(u, delta, A, B, C, D, z, delta_bias, delta_softplus, return_last_state)
+    elif SCAN_OPTION == "torch":
+        return selective_scan_torch(u, delta, A, B, C, D, z, delta_bias, delta_softplus, return_last_state)
+    elif SCAN_OPTION == "cudaparallel":
+        return selective_scan_cudaparallel(u, delta, A, B, C, D, z, delta_bias, delta_softplus, return_last_state)
     else:
         return SelectiveScanFn.apply(u, delta, A, B, C, D, z, delta_bias, delta_softplus, return_last_state)
 
-SEEN_SCAN_REF = False
+SEEN_SCAN_REF = -3
 
 def selective_scan_ref(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta_softplus=False,
                       return_last_state=False):
@@ -153,7 +193,7 @@ def selective_scan_ref(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta
     last_state (optional): r(B D dstate) or c(B D dstate)
     """
     global SEEN_SCAN_REF
-    if SEEN_SCAN_REF is not True:
+    if SEEN_SCAN_REF == -3:
         msg = dedent("""
             selective_scan_ref(
                 u.shape: {u.shape} (dtype: {u.dtype}),
@@ -171,7 +211,7 @@ def selective_scan_ref(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta
                    delta_bias=delta_bias, delta_softplus=delta_softplus,
                    return_last_state=return_last_state))
         print(msg)
-        SEEN_SCAN_REF = None
+        SEEN_SCAN_REF = -2
     dtype_in = u.dtype
     u = u.float()
     delta = delta.float()
@@ -204,7 +244,7 @@ def selective_scan_ref(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta
     if is_variable_C and C.dim() == 4:
         C = repeat(C, "B G N L -> B (G H) N L", H=dim // C.shape[1])
     last_state = None
-    if SEEN_SCAN_REF is None:
+    if SEEN_SCAN_REF == -2:
         msg = dedent(f'''
             selective_scan_ref: pre-loop (for i in range({u.shape[2]}))
                 u.shape: {u.shape} (dtype: {u.dtype})
@@ -240,8 +280,438 @@ def selective_scan_ref(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta
                 len(last_state): {len(last_state)}
             ''')
         print(msg)
-        SEEN_SCAN_REF = True
+        SEEN_SCAN_REF = None
     return out if not return_last_state else (out, last_state)
+
+def selective_scan_ref_simple(u, delta, A, B, C, D=None, z=None,
+                       delta_bias=None, delta_softplus=False,
+                       return_last_state=False):
+    dtype_in = u.dtype
+    u = u.float()
+    delta = delta.float()
+    delta = delta + delta_bias[..., None].float()
+    delta = F.softplus(delta)
+    batch = u.shape[0]
+    dim = A.shape[0] # 5120 for 2.8b
+    dstate = A.shape[1] # 16 for 2.8b
+    assert B.dim() >= 3, B.dim()
+    assert C.dim() >= 3, C.dim()
+    B = B.float()
+    C = C.float()
+    x = A.new_zeros((batch, dim, dstate))
+    ys = []
+    # Perform the discretization steps.
+    deltaA = torch.exp(torch.einsum('bdl,dn->bdln', delta, A))
+    deltaB_u = torch.einsum('bdl,bnl,bdl->bdln', delta, B, u)
+    last_state = None
+
+    for i in range(u.shape[2]): # prompt length
+        # The prefix scan:
+        x = deltaA[:, :, i] * x + deltaB_u[:, :, i]
+
+        y = torch.einsum('bdn,bn->bd', x, C[:, :, i])
+        if i == u.shape[2] - 1:
+            last_state = x
+        ys.append(y)
+    # ys = 1000 elem array of torch.Size([16, 5120])
+    y = torch.stack(ys, dim=2) # (batch dim L)
+    # y.shape = torch.Size([16, 5120, 1000])
+    out = rearrange(D, "d -> d 1")
+    out = y + u * out
+    out = out * F.silu(z)
+    out = out.to(dtype=torch.float16)
+    return (out, last_state)
+
+
+def selective_scan_torch(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta_softplus=False,
+                      return_last_state=False):
+    """
+    u: r(B D L)
+    delta: r(B D L)
+    A: c(D N) or r(D N)
+    B: c(D N) or r(B N L) or r(B N 2L) or r(B G N L) or (B G N L)
+    C: c(D N) or r(B N L) or r(B N 2L) or r(B G N L) or (B G N L)
+    D: r(D)
+    z: r(B D L)
+    delta_bias: r(D), fp32
+
+    out: r(B D L)
+    last_state (optional): r(B D dstate) or c(B D dstate)
+    """
+    from torch._higher_order_ops.associative_scan import (
+        associative_scan,
+    )
+
+    def s5_operator(x, y):
+        A_i, Bu_i = x
+        A_j, Bu_j = y
+        return A_j * A_i, A_j * Bu_i + Bu_j
+
+    use_associative_scan = True
+
+    def _selective_scan_torch(u, delta, A, B, C, D, z, delta_bias, delta_softplus):
+        dtype_in = u.dtype
+        u = u.float()
+        delta = delta.float()
+        if delta_bias is not None:
+            delta = delta + delta_bias[..., None].float()
+        if delta_softplus:
+            delta = F.softplus(delta)
+        batch, dim, dstate = u.shape[0], A.shape[0], A.shape[1]
+        is_variable_B = B.dim() >= 3
+        is_variable_C = C.dim() >= 3
+        if A.is_complex():
+            if is_variable_B:
+                B = torch.view_as_complex(rearrange(B.float(), "... (L two) -> ... L two", two=2))
+            if is_variable_C:
+                C = torch.view_as_complex(rearrange(C.float(), "... (L two) -> ... L two", two=2))
+        else:
+            B = B.float()
+            C = C.float()
+
+        deltaA = torch.exp(torch.einsum('bdl,dn->bdln', delta, A))
+        if not is_variable_B:
+            deltaB_u = torch.einsum('bdl,dn,bdl->bdln', delta, B, u)
+        else:
+            if B.dim() == 3:
+                deltaB_u = torch.einsum('bdl,bnl,bdl->bdln', delta, B, u)
+            else:
+                B = repeat(B, "B G N L -> B (G H) N L", H=dim // B.shape[1])
+                deltaB_u = torch.einsum('bdl,bdnl,bdl->bdln', delta, B, u)
+        if is_variable_C and C.dim() == 4:
+            C = repeat(C, "B G N L -> B (G H) N L", H=dim // C.shape[1])
+        last_state_scan = None
+
+        if use_associative_scan:
+            _, x_scan = associative_scan(s5_operator, (deltaA, deltaB_u), 2, combine_mode=combine_mode)
+            if not is_variable_C:
+                raise NotImplementedError('This feature is not yet implemented!')
+                y = torch.einsum('bdn,dn->bd', x_scan, C)
+            else:
+                if C.dim() == 3:
+                    y_scan = torch.einsum('bdsn,bns->bds', x_scan, C)
+                else:
+                    raise NotImplementedError('This feature is not yet implemented!')
+                    y = torch.einsum('bdns,bdns->bds', x_scan, C)
+            last_state_scan = x_scan[:, :, -1, :]
+            if y_scan.is_complex():
+                y_scan = y_scan.real * 2
+        else:
+            pass
+
+        out = y_scan if D is None else y_scan + u * rearrange(D, "d -> d 1")
+        if z is not None:
+            out = out * F.silu(z)
+        out = out.to(dtype=dtype_in)
+
+        return out, last_state_scan
+
+    #comment = '_compile'
+    # combine_mode = 'generic'
+    combine_mode = 'pointwise'
+
+    if 'compile' in comment:
+        _selective_scan_torch_cmp = torch.compile(_selective_scan_torch, fullgraph=True, mode='reduce-overhead')
+    else:
+        _selective_scan_torch_cmp = _selective_scan_torch
+
+    out, last_state = _selective_scan_torch_cmp(u, delta, A, B, C, D, z, delta_bias, delta_softplus)
+
+    return out if not return_last_state else (out, last_state)
+
+# torch cuda parallel
+# ---------------------------------------------------------------------
+#  ── 1.  point‑wise associative operator used by the scan  ─────────────────
+# ---------------------------------------------------------------------
+def s5_operator_2(x, y):
+    """
+    x, y are tuples (A_i, Bu_i) and (A_j, Bu_j)
+    The binary op composes the two affine maps:
+        h  ↦  A_i h + Bu_i     followed by     h ↦  A_j h + Bu_j
+    returning the composed (A_j A_i ,  A_j Bu_i + Bu_j)
+    """
+    A_i, Bu_i = x
+    A_j, Bu_j = y
+    return A_j * A_i, A_j * Bu_i + Bu_j
+
+
+# ---------------------------------------------------------------------
+#  ── 2.  selective‑scan with CUDA‑parallel inclusive scan  ────────────
+# ---------------------------------------------------------------------
+def selective_scan_torch_cudaparallel(
+    u, delta, A, B, C,
+    D=None, z=None,
+    delta_bias=None,
+    delta_softplus=False,
+    return_last_state=False,
+    combine_mode: str = "pointwise",  # forwarded to associative_scan
+    ):
+    """
+    CUDA‑parallel version of the selective scan.
+    Shape conventions (all real tensors, fp16/fp32 mix is fine)::
+
+        u, delta, z     : (B, D, L)
+        A               : (D, N)
+        B, C            : (B, N, L)               # "variable‑B / variable‑C" path
+        D               : (D,)
+    """
+    # ----  pre‑processing ----------------------------------------------------
+    dtype_in = u.dtype
+    u      = u.float()                 # do math in fp32 for numerical safety
+    delta  = delta.float()
+    B      = B.float()
+    C      = C.float()
+
+    if delta_bias is not None:
+        delta = delta + delta_bias[..., None].float()
+    if delta_softplus:
+        delta = F.softplus(delta)
+
+    Bsz, Dim, L = u.shape
+    Dstate      = A.shape[1]           # N
+
+    # ----  discretise A and (B ∘ u) -----------------------------------------
+    # deltaA, deltaB_u : (B, D, L, N)
+    deltaA   = torch.exp(torch.einsum("bdl,dn->bdln", delta, A))
+    deltaB_u = torch.einsum("bdl,bnl,bdl->bdln", delta, B, u)
+
+    # ----  parallel prefix scan over sequence dimension ---------------------
+    #       (B, D, L, N)  ←  associative_scan( s5_operator, ... , dim=2 )
+    #
+    from torch._higher_order_ops.cuda_parallel_associative_scan import (
+        associative_scan,
+    )
+
+    (_,  x_scan) = associative_scan(           # we only need the composed Bu
+        s5_operator_2,
+        (deltaA, deltaB_u),                    # two‑tuple input
+        dim     = 2,                           # scan over sequence dimension
+        reverse = False,
+        combine_mode = combine_mode,           # "pointwise" is fastest
+    )
+    # x_scan : (B, D, L, N)
+    last_state = x_scan[..., -1, :]            # (B, D, N)
+
+    # ----  read‑out  y_t  ----------------------------------------------------
+    # C is (B, N, L)          → einsum over N
+    y_scan = torch.einsum("bdsn,bns->bds", x_scan, C)   # (B, D, L)
+
+    # ----  residual / gating / cast back ------------------------------------
+    out = y_scan if D is None else y_scan + u * rearrange(D, "d -> d 1")
+    if z is not None:
+        out = out * F.silu(z)
+    out = out.to(dtype_in)
+
+    return (out, last_state) if return_last_state else out
+
+# raw cuda.parallel
+if not is_cuda_parallel_available:
+    raise ImportError('cuda.parallel is not available')
+
+# ---------------------------------------------------------------------------
+#  selective_scan_cudaparallel.py
+# ---------------------------------------------------------------------------
+# N.B. Was experiencing some inexplicable issues with the import order, hence
+#      this insanity below.
+
+print('About to import cupy...')
+import cupy as cp
+print('cupy imported successfully')
+print('About to import numba...')
+import numba
+print('numba imported successfully')
+print('About to import algorithms...')
+import cuda.parallel.experimental.algorithms as algorithms
+print('algorithms imported successfully')
+print('About to import iterators...')
+import cuda.parallel.experimental.iterators as iterators
+print('iterators imported successfully')
+print('About to import make_ndarray_iterator...')
+from cuda.parallel.experimental.iterators._strided import make_ndarray_iterator
+print('make_ndarray_iterator imported successfully')
+#print('About to import zip_iterator...')
+#from cuda.parallel.experimental.iterators import zip_iterator
+#print('zip_iterator imported successfully')
+
+# ─────────────────────────────────────────────────────────────────────────────
+# helpers
+# ─────────────────────────────────────────────────────────────────────────────
+def torch_to_cupy(t: torch.Tensor) -> cp.ndarray:
+    """Zero‑copy view of a torch CUDA tensor as a CuPy array."""
+    return cp.from_dlpack(torch.utils.dlpack.to_dlpack(t.contiguous()))
+
+def cupy_to_torch(a: cp.ndarray) -> torch.Tensor:
+    """Zero‑copy view of a CuPy array as a torch CUDA tensor."""
+    return torch.utils.dlpack.from_dlpack(a.toDlpack())
+
+# ─────────────────────────────────────────────────────────────────────────────
+# device‑side combine operator  (A, Bu)  ∘  (A', Bu')
+# ─────────────────────────────────────────────────────────────────────────────
+if False:
+    _pair_dtype = cp.dtype([("A",  "f4"),
+                            ("Bu", "f4")])
+    _pair_nbtype = numba.from_dtype(_pair_dtype)
+
+    @numba.cuda.jit(device=True)
+    def _s5_op(x, y):
+        """
+        Compose two affine maps  h ↦ A·h + Bu  and  h ↦ A'·h + Bu'
+        returning  (A'A,  A'·Bu + Bu')
+        """
+        out = _pair_nbtype()
+        out.A  = y.A * x.A
+        out.Bu = y.A * x.Bu + y.Bu
+        return out
+
+pair_type = numba.types.Record.make_c_struct([
+    ("A",  numba.types.float32),
+    ("Bu", numba.types.float32),
+])
+
+@numba.cuda.jit(device=True)
+def s5_op(x, y):
+    """
+    x,y : pair_type
+    out : pair_type   =  (y.A * x.A ,  y.A * x.Bu + y.Bu)
+    """
+    out = numba.cuda.local.array(1, dtype=pair_type)[0]  # create empty record
+    out.A  = y.A * x.A
+    out.Bu = y.A * x.Bu + y.Bu
+    return out
+
+# Define the scan operator directly in the device code
+# This is a new version that works with separate A and Bu arrays
+@numba.cuda.jit(device=True)
+def s5_op_separate(A_Bu_state, next_inputs):
+    A_prev, Bu_prev = A_Bu_state
+    A_next, Bu_next = next_inputs
+
+    # Implement (A_j * A_i, A_j * Bu_i + Bu_j)
+    new_A = A_next
+    new_Bu = A_next * Bu_prev + Bu_next
+
+    return (new_A, new_Bu)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# main routine
+# ─────────────────────────────────────────────────────────────────────────────
+def selective_scan_cudaparallel(
+    u, delta, A, B, C,
+    D=None, z=None,
+    delta_bias=None,
+    delta_softplus=False,
+    return_last_state=False,
+    ):
+    """
+    Same signature as selective_scan_ref, but the prefix scan along sequence
+    length L is executed by cuda.parallel's inclusive_scan.
+    Only the real‑valued (fp16 / fp32) code‑path is included for brevity.
+    """
+    # -------- pre‑processing -------------------------------------------------
+    dtype_in = u.dtype
+    u      = u.float()
+    delta  = delta.float()
+    B      = B.float()
+    C      = C.float()
+
+    if delta_bias is not None:
+        delta = delta + delta_bias[..., None].float()
+    if delta_softplus:
+        delta = F.softplus(delta)
+
+    Bsz, Dim, L = u.shape
+    N           = A.shape[1]                    # SSM state dim per channel
+
+    # -------- discretisation  ----------------------------------------------
+    # deltaA, deltaB_u  :  (B, D, L, N)
+    deltaA   = torch.exp(torch.einsum("bdl,dn->bdln", delta, A))
+    deltaB_u = torch.einsum("bdl,bnl,bdl->bdln", delta, B, u)
+
+    # -------- move to CuPy (zero‑copy via DLPack) ---------------------------
+    dA_cp  = torch_to_cupy(deltaA)
+    dBu_cp = torch_to_cupy(deltaB_u)
+
+    # -------- reshape so each (b,d,n) stream is a contiguous 1‑D segment ---
+    #
+    #   (B, D, L, N)  →  (G, L)   where  G = B·D·N
+    #
+    G = Bsz * Dim * N
+    dA_flat  = dA_cp.transpose(0, 1, 3, 2).reshape(G, L)
+    dBu_flat = dBu_cp.transpose(0, 1, 3, 2).reshape(G, L)
+
+    # ------------------------------------------------------------------
+    # 1.  Setup for the CUDA parallel scan
+    # ------------------------------------------------------------------
+
+    A_in = dA_flat    # (G, L) float32
+    Bu_in = dBu_flat  # (G, L) float32
+    A_out = cp.empty_like(A_in)
+    Bu_out = cp.empty_like(Bu_in)
+
+
+    # Initialize values
+    init_val = (1.0, 0.0)  # Identity value for (A, Bu)
+
+    # -------- run cuda.parallel inclusive_scan using s5_op_separate ---------------
+    for g in range(G):
+        # Create iterators for this row
+        A_in_it = make_ndarray_iterator(
+            A_in[g],
+            (0,),
+            iterators._iterators.IteratorIO.INPUT,
+            "A_in",
+        )
+        Bu_in_it = make_ndarray_iterator(
+            Bu_in[g],
+            (0,),
+            iterators._iterators.IteratorIO.INPUT,
+            "Bu_in",
+        )
+        A_out_it = make_ndarray_iterator(
+            A_out[g],
+            (0,),
+            iterators._iterators.IteratorIO.OUTPUT,
+            "A_out",
+        )
+        Bu_out_it = make_ndarray_iterator(
+            Bu_out[g],
+            (0,),
+            iterators._iterators.IteratorIO.OUTPUT,
+            "Bu_out",
+        )
+
+        # Create zip iterators to handle (A, Bu) pairs
+        input_it = zip_iterator([A_in_it, Bu_in_it], "input")
+        output_it = zip_iterator([A_out_it, Bu_out_it], "output")
+
+        # Use CUDA parallel inclusive scan
+        scanner = algorithms.inclusive_scan(
+            input_it, output_it, s5_op_separate, init_val
+        )
+
+        # Run the scan
+        tmp_sz = scanner(None, input_it, output_it, L, init_val)
+        tmp_buf = cp.empty((tmp_sz,), dtype=cp.uint8)
+        scanner(tmp_buf, input_it, output_it, L, init_val)
+
+    # ------------------------------------------------------------------
+    # 2.  After the scan, use the Bu component
+    # ------------------------------------------------------------------
+    Bu_scan_t = cupy_to_torch(Bu_out)  # Convert to torch tensor
+
+    # reshape back to (B, D, L, N)
+    x_scan     = Bu_scan_t.reshape(Bsz, Dim, N, L).permute(0, 1, 3, 2)
+    last_state = x_scan[:, :, -1, :]
+
+    # -------- read‑out & residual path -------------------------------------
+    y_scan = torch.einsum("bdsn,bns->bds", x_scan, C)      # (B,D,L)
+
+    out = y_scan if D is None else y_scan + u * rearrange(D.float(), "d -> d 1")
+    if z is not None:
+        out = out * F.silu(z.float())
+    out = out.to(dtype_in)
+
+    return (out, last_state) if return_last_state else out
 
 
 class MambaInnerFn(torch.autograd.Function):
@@ -437,9 +907,19 @@ def mamba_inner_fn(
     xz, conv1d_weight, conv1d_bias, x_proj_weight, delta_proj_weight,
     out_proj_weight, out_proj_bias,
     A, B=None, C=None, D=None, delta_bias=None, B_proj_bias=None,
-    C_proj_bias=None, delta_softplus=True, checkpoint_lvl=1, b_rms_weight= None, c_rms_weight= None, dt_rms_weight= None, b_c_dt_rms_eps=1e-6
+    C_proj_bias=None, delta_softplus=True, checkpoint_lvl=1,
+    b_rms_weight=None, c_rms_weight=None, dt_rms_weight=None,
+    b_c_dt_rms_eps=1e-6
 ):
     if SCAN_OPTION == "ref":
+        return mamba_inner_ref(
+            xz, conv1d_weight, conv1d_bias, x_proj_weight, delta_proj_weight,
+            out_proj_weight, out_proj_bias,
+            A, B, C, D, delta_bias, B_proj_bias,
+            C_proj_bias, delta_softplus
+        )
+    elif SCAN_OPTION == "torch" or SCAN_OPTION == "torchscan":
+        # For the torch implementation, we also use mamba_inner_ref which calls selective_scan_fn internally
         return mamba_inner_ref(
             xz, conv1d_weight, conv1d_bias, x_proj_weight, delta_proj_weight,
             out_proj_weight, out_proj_bias,

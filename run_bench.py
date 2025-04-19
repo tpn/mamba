@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+
+try:
+    import cuda.parallel.experimental.algorithms
+    print('cuda.parallel.experimental.algorithms imported successfully')
+except ImportError:
+    print('Error! cuda.parallel.experimental.algorithms not found!')
+
 import argparse
 import datetime
 import itertools
@@ -98,31 +105,57 @@ def run_benchmark(scan, promptlen, genlen, batch, with_nsys=False):
     run_realtime(cmd, text_file)
 
 def parse_comma_separated_values(values_str):
+    if ',' not in values_str:
+        return [values_str.strip()]
     return [val.strip() for val in values_str.split(',')]
 
 def parse_int_list(values_str):
+    if ',' not in values_str:
+        return [int(values_str.strip())]
     return [int(val.strip()) for val in values_str.split(',')]
 
+
+SCAN_OPTIONS = [
+    "cuda",
+    "cuda2",
+    "ref",
+    "torch",
+    "torch-cudaparallel",
+    "cudaparallel",
+]
+
+
 def main():
-    parser = argparse.ArgumentParser(description='Run Mamba benchmarks')
-    parser.add_argument('--scans', type=str, default='cuda,ref',
-                        help='Comma-separated list of scan types (cuda, ref)')
-    parser.add_argument('--promptlens', type=str, default='10,100,1000,10000',
-                        help='Comma-separated list of prompt lengths to benchmark')
-    parser.add_argument('--genlens', type=str, default='100,1000,10000',
-                        help='Comma-separated list of generation lengths to benchmark')
-    parser.add_argument('--batches', type=str, default='1,4,8,16,32,64,128,256',
-                        help='Comma-separated list of batch sizes to benchmark')
+    parser = argparse.ArgumentParser(
+        description='Run Mamba benchmarks',
+        formatter_class=argparse.RawTextHelpFormatter
+    )
+    parser.add_argument('--promptlen', type=str, default='10',
+                        help='Single or comma-separated list of prompt lengths to benchmark')
+    parser.add_argument('--genlen', type=str, default='10',
+                        help='Single or comma-separated list of generation lengths to benchmark')
+    parser.add_argument('--batch', type=str, default='1',
+                        help='Single or comma-separated list of batch sizes to benchmark')
     parser.add_argument('--with-nsys', action='store_true',
                         help='Run with Nsys profiling')
+    parser.add_argument("--scan", type=str, choices=SCAN_OPTIONS, default="cuda",
+                        help=(
+                            "Selective scan implementation to use:\n"
+                            "   cuda (selective_scan_cuda),\n"
+                            "   cuda2 (selective_scan2_cuda),\n"
+                            "   ref (reference implementation),\n"
+                            "   torch (pytorch associative scan wrapper),\n"
+                            "   torch-cudaparallel (actual PyTorch associative scan),\n"
+                            "   cudaparallel (cuda.parallel associative scan)\n"
+                        ))
 
     args = parser.parse_args()
 
     # Parse comma-separated values
-    scans = parse_comma_separated_values(args.scans)
-    promptlens = parse_int_list(args.promptlens)
-    genlens = parse_int_list(args.genlens)
-    batches = parse_int_list(args.batches)
+    scans = [args.scan]  # Use the single scan argument
+    promptlens = parse_int_list(args.promptlen)
+    genlens = parse_int_list(args.genlen)
+    batches = parse_int_list(args.batch)
 
     # Create cartesian product of all parameters
     parameter_combinations = itertools.product(scans, promptlens, genlens, batches)
