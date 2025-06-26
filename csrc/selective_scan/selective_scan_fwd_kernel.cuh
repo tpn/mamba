@@ -148,7 +148,7 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
         }
         u += kChunkSize;
         delta += kChunkSize;
-    
+
         float delta_vals[kNRows][kNItems], delta_u_vals[kNRows][kNItems], out_vals[kNRows][kNItems];
         #pragma unroll
         for (int r = 0; r < kNRows; ++r) {
@@ -270,7 +270,7 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
                 }
             }
         }
-        
+
         input_t *out = reinterpret_cast<input_t *>(params.out_ptr) + batch_id * params.out_batch_stride
             + dim_id * kNRows * params.out_d_stride + chunk * kChunkSize;
         __syncthreads();
@@ -317,17 +317,16 @@ void selective_scan_fwd_launch(SSMParamsBase &params, cudaStream_t stream) {
             BOOL_SWITCH(params.is_variable_C, kIsVariableC, [&] {
                 BOOL_SWITCH(params.z_ptr != nullptr , kHasZ, [&] {
                     using Ktraits = Selective_Scan_fwd_kernel_traits<kNThreads, kNItems, kNRows, kIsEvenLen, kIsVariableB, kIsVariableC, kHasZ, input_t, weight_t>;
-                    
+
                     constexpr int kSmemSize = Ktraits::kSmemSize + kNRows * MAX_DSTATE * sizeof(typename Ktraits::scan_t);
                     dim3 grid(params.batch, params.dim / kNRows);
-
-                    // Had to change this substantially since potentially the hip 
-                    // interface for setting kernel launch attributes is slightly different from 
+                    // Had to change this substantially since potentially the hip
+                    // interface for setting kernel launch attributes is slightly different from
                     // cuda's. In particualar, it seems to expect a plain const void * pointer.
 
                     auto kernel = &selective_scan_fwd_kernel<Ktraits>;
 
-                    
+
                     if (kSmemSize >= 48 * 1024) {
                         #ifndef USE_ROCM
                         C10_CUDA_CHECK(cudaFuncSetAttribute(
@@ -351,7 +350,7 @@ template<typename input_t, typename weight_t>
 void selective_scan_fwd_cuda(SSMParamsBase &params, cudaStream_t stream) {
 
     #ifndef USE_ROCM
-        if (params.seqlen <= 128) {           
+        if (params.seqlen <= 128) {
             selective_scan_fwd_launch<32, 4, input_t, weight_t>(params, stream);
         } else if (params.seqlen <= 256) {
             selective_scan_fwd_launch<32, 8, input_t, weight_t>(params, stream);

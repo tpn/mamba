@@ -44,7 +44,7 @@ if SCAN_OPTION == "cuda":
     import selective_scan_cuda
 elif SCAN_OPTION == "cuda2":
     import selective_scan2_cuda as selective_scan_cuda
-elif SCAN_OPTION in ["ref"]:
+elif SCAN_OPTION in ["ref", "ref-simple"]:
     pass
 elif SCAN_OPTION in ["torch"]:
     pass
@@ -168,6 +168,8 @@ def selective_scan_fn(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta_
     """
     if SCAN_OPTION == "ref":
         return selective_scan_ref(u, delta, A, B, C, D, z, delta_bias, delta_softplus, return_last_state)
+    elif SCAN_OPTION == "ref-simple":
+        return selective_scan_ref_simple(u, delta, A, B, C, D, z, delta_bias, delta_softplus, return_last_state)
     elif SCAN_OPTION == "torch":
         return selective_scan_torch(u, delta, A, B, C, D, z, delta_bias, delta_softplus, return_last_state)
     elif SCAN_OPTION == "cudaparallel":
@@ -505,213 +507,214 @@ def selective_scan_torch_cudaparallel(
     return (out, last_state) if return_last_state else out
 
 # raw cuda.parallel
-if not is_cuda_parallel_available:
-    raise ImportError('cuda.parallel is not available')
-
-# ---------------------------------------------------------------------------
-#  selective_scan_cudaparallel.py
-# ---------------------------------------------------------------------------
-# N.B. Was experiencing some inexplicable issues with the import order, hence
-#      this insanity below.
-
-print('About to import cupy...')
-import cupy as cp
-print('cupy imported successfully')
-print('About to import numba...')
-import numba
-print('numba imported successfully')
-print('About to import algorithms...')
-import cuda.parallel.experimental.algorithms as algorithms
-print('algorithms imported successfully')
-print('About to import iterators...')
-import cuda.parallel.experimental.iterators as iterators
-print('iterators imported successfully')
-print('About to import make_ndarray_iterator...')
-from cuda.parallel.experimental.iterators._strided import make_ndarray_iterator
-print('make_ndarray_iterator imported successfully')
-#print('About to import zip_iterator...')
-#from cuda.parallel.experimental.iterators import zip_iterator
-#print('zip_iterator imported successfully')
-
-# ─────────────────────────────────────────────────────────────────────────────
-# helpers
-# ─────────────────────────────────────────────────────────────────────────────
-def torch_to_cupy(t: torch.Tensor) -> cp.ndarray:
-    """Zero‑copy view of a torch CUDA tensor as a CuPy array."""
-    return cp.from_dlpack(torch.utils.dlpack.to_dlpack(t.contiguous()))
-
-def cupy_to_torch(a: cp.ndarray) -> torch.Tensor:
-    """Zero‑copy view of a CuPy array as a torch CUDA tensor."""
-    return torch.utils.dlpack.from_dlpack(a.toDlpack())
-
-# ─────────────────────────────────────────────────────────────────────────────
-# device‑side combine operator  (A, Bu)  ∘  (A', Bu')
-# ─────────────────────────────────────────────────────────────────────────────
 if False:
-    _pair_dtype = cp.dtype([("A",  "f4"),
-                            ("Bu", "f4")])
-    _pair_nbtype = numba.from_dtype(_pair_dtype)
+    #if not is_cuda_parallel_available:
+    #    raise ImportError('cuda.parallel is not available')
+
+    # ---------------------------------------------------------------------------
+    #  selective_scan_cudaparallel.py
+    # ---------------------------------------------------------------------------
+    # N.B. Was experiencing some inexplicable issues with the import order, hence
+    #      this insanity below.
+
+    print('About to import cupy...')
+    import cupy as cp
+    print('cupy imported successfully')
+    print('About to import numba...')
+    import numba
+    print('numba imported successfully')
+    print('About to import algorithms...')
+    import cuda.parallel.experimental.algorithms as algorithms
+    print('algorithms imported successfully')
+    print('About to import iterators...')
+    import cuda.parallel.experimental.iterators as iterators
+    print('iterators imported successfully')
+    print('About to import make_ndarray_iterator...')
+    from cuda.parallel.experimental.iterators._strided import make_ndarray_iterator
+    print('make_ndarray_iterator imported successfully')
+    #print('About to import zip_iterator...')
+    #from cuda.parallel.experimental.iterators import zip_iterator
+    #print('zip_iterator imported successfully')
+
+    # ─────────────────────────────────────────────────────────────────────────────
+    # helpers
+    # ─────────────────────────────────────────────────────────────────────────────
+    def torch_to_cupy(t: torch.Tensor) -> cp.ndarray:
+        """Zero‑copy view of a torch CUDA tensor as a CuPy array."""
+        return cp.from_dlpack(torch.utils.dlpack.to_dlpack(t.contiguous()))
+
+    def cupy_to_torch(a: cp.ndarray) -> torch.Tensor:
+        """Zero‑copy view of a CuPy array as a torch CUDA tensor."""
+        return torch.utils.dlpack.from_dlpack(a.toDlpack())
+
+    # ─────────────────────────────────────────────────────────────────────────────
+    # device‑side combine operator  (A, Bu)  ∘  (A', Bu')
+    # ─────────────────────────────────────────────────────────────────────────────
+    if False:
+        _pair_dtype = cp.dtype([("A",  "f4"),
+                                ("Bu", "f4")])
+        _pair_nbtype = numba.from_dtype(_pair_dtype)
+
+        @numba.cuda.jit(device=True)
+        def _s5_op(x, y):
+            """
+            Compose two affine maps  h ↦ A·h + Bu  and  h ↦ A'·h + Bu'
+            returning  (A'A,  A'·Bu + Bu')
+            """
+            out = _pair_nbtype()
+            out.A  = y.A * x.A
+            out.Bu = y.A * x.Bu + y.Bu
+            return out
+
+    pair_type = numba.types.Record.make_c_struct([
+        ("A",  numba.types.float32),
+        ("Bu", numba.types.float32),
+    ])
 
     @numba.cuda.jit(device=True)
-    def _s5_op(x, y):
+    def s5_op(x, y):
         """
-        Compose two affine maps  h ↦ A·h + Bu  and  h ↦ A'·h + Bu'
-        returning  (A'A,  A'·Bu + Bu')
+        x,y : pair_type
+        out : pair_type   =  (y.A * x.A ,  y.A * x.Bu + y.Bu)
         """
-        out = _pair_nbtype()
+        out = numba.cuda.local.array(1, dtype=pair_type)[0]  # create empty record
         out.A  = y.A * x.A
         out.Bu = y.A * x.Bu + y.Bu
         return out
 
-pair_type = numba.types.Record.make_c_struct([
-    ("A",  numba.types.float32),
-    ("Bu", numba.types.float32),
-])
+    # Define the scan operator directly in the device code
+    # This is a new version that works with separate A and Bu arrays
+    @numba.cuda.jit(device=True)
+    def s5_op_separate(A_Bu_state, next_inputs):
+        A_prev, Bu_prev = A_Bu_state
+        A_next, Bu_next = next_inputs
 
-@numba.cuda.jit(device=True)
-def s5_op(x, y):
-    """
-    x,y : pair_type
-    out : pair_type   =  (y.A * x.A ,  y.A * x.Bu + y.Bu)
-    """
-    out = numba.cuda.local.array(1, dtype=pair_type)[0]  # create empty record
-    out.A  = y.A * x.A
-    out.Bu = y.A * x.Bu + y.Bu
-    return out
+        # Implement (A_j * A_i, A_j * Bu_i + Bu_j)
+        new_A = A_next
+        new_Bu = A_next * Bu_prev + Bu_next
 
-# Define the scan operator directly in the device code
-# This is a new version that works with separate A and Bu arrays
-@numba.cuda.jit(device=True)
-def s5_op_separate(A_Bu_state, next_inputs):
-    A_prev, Bu_prev = A_Bu_state
-    A_next, Bu_next = next_inputs
+        return (new_A, new_Bu)
 
-    # Implement (A_j * A_i, A_j * Bu_i + Bu_j)
-    new_A = A_next
-    new_Bu = A_next * Bu_prev + Bu_next
+    # ─────────────────────────────────────────────────────────────────────────────
+    # main routine
+    # ─────────────────────────────────────────────────────────────────────────────
+    def selective_scan_cudaparallel(
+        u, delta, A, B, C,
+        D=None, z=None,
+        delta_bias=None,
+        delta_softplus=False,
+        return_last_state=False,
+        ):
+        """
+        Same signature as selective_scan_ref, but the prefix scan along sequence
+        length L is executed by cuda.parallel's inclusive_scan.
+        Only the real‑valued (fp16 / fp32) code‑path is included for brevity.
+        """
+        # -------- pre‑processing -------------------------------------------------
+        dtype_in = u.dtype
+        u      = u.float()
+        delta  = delta.float()
+        B      = B.float()
+        C      = C.float()
 
-    return (new_A, new_Bu)
+        if delta_bias is not None:
+            delta = delta + delta_bias[..., None].float()
+        if delta_softplus:
+            delta = F.softplus(delta)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# main routine
-# ─────────────────────────────────────────────────────────────────────────────
-def selective_scan_cudaparallel(
-    u, delta, A, B, C,
-    D=None, z=None,
-    delta_bias=None,
-    delta_softplus=False,
-    return_last_state=False,
-    ):
-    """
-    Same signature as selective_scan_ref, but the prefix scan along sequence
-    length L is executed by cuda.parallel's inclusive_scan.
-    Only the real‑valued (fp16 / fp32) code‑path is included for brevity.
-    """
-    # -------- pre‑processing -------------------------------------------------
-    dtype_in = u.dtype
-    u      = u.float()
-    delta  = delta.float()
-    B      = B.float()
-    C      = C.float()
+        Bsz, Dim, L = u.shape
+        N           = A.shape[1]                    # SSM state dim per channel
 
-    if delta_bias is not None:
-        delta = delta + delta_bias[..., None].float()
-    if delta_softplus:
-        delta = F.softplus(delta)
+        # -------- discretisation  ----------------------------------------------
+        # deltaA, deltaB_u  :  (B, D, L, N)
+        deltaA   = torch.exp(torch.einsum("bdl,dn->bdln", delta, A))
+        deltaB_u = torch.einsum("bdl,bnl,bdl->bdln", delta, B, u)
 
-    Bsz, Dim, L = u.shape
-    N           = A.shape[1]                    # SSM state dim per channel
+        # -------- move to CuPy (zero‑copy via DLPack) ---------------------------
+        dA_cp  = torch_to_cupy(deltaA)
+        dBu_cp = torch_to_cupy(deltaB_u)
 
-    # -------- discretisation  ----------------------------------------------
-    # deltaA, deltaB_u  :  (B, D, L, N)
-    deltaA   = torch.exp(torch.einsum("bdl,dn->bdln", delta, A))
-    deltaB_u = torch.einsum("bdl,bnl,bdl->bdln", delta, B, u)
+        # -------- reshape so each (b,d,n) stream is a contiguous 1‑D segment ---
+        #
+        #   (B, D, L, N)  →  (G, L)   where  G = B·D·N
+        #
+        G = Bsz * Dim * N
+        dA_flat  = dA_cp.transpose(0, 1, 3, 2).reshape(G, L)
+        dBu_flat = dBu_cp.transpose(0, 1, 3, 2).reshape(G, L)
 
-    # -------- move to CuPy (zero‑copy via DLPack) ---------------------------
-    dA_cp  = torch_to_cupy(deltaA)
-    dBu_cp = torch_to_cupy(deltaB_u)
+        # ------------------------------------------------------------------
+        # 1.  Setup for the CUDA parallel scan
+        # ------------------------------------------------------------------
 
-    # -------- reshape so each (b,d,n) stream is a contiguous 1‑D segment ---
-    #
-    #   (B, D, L, N)  →  (G, L)   where  G = B·D·N
-    #
-    G = Bsz * Dim * N
-    dA_flat  = dA_cp.transpose(0, 1, 3, 2).reshape(G, L)
-    dBu_flat = dBu_cp.transpose(0, 1, 3, 2).reshape(G, L)
-
-    # ------------------------------------------------------------------
-    # 1.  Setup for the CUDA parallel scan
-    # ------------------------------------------------------------------
-
-    A_in = dA_flat    # (G, L) float32
-    Bu_in = dBu_flat  # (G, L) float32
-    A_out = cp.empty_like(A_in)
-    Bu_out = cp.empty_like(Bu_in)
+        A_in = dA_flat    # (G, L) float32
+        Bu_in = dBu_flat  # (G, L) float32
+        A_out = cp.empty_like(A_in)
+        Bu_out = cp.empty_like(Bu_in)
 
 
-    # Initialize values
-    init_val = (1.0, 0.0)  # Identity value for (A, Bu)
+        # Initialize values
+        init_val = (1.0, 0.0)  # Identity value for (A, Bu)
 
-    # -------- run cuda.parallel inclusive_scan using s5_op_separate ---------------
-    for g in range(G):
-        # Create iterators for this row
-        A_in_it = make_ndarray_iterator(
-            A_in[g],
-            (0,),
-            iterators._iterators.IteratorIO.INPUT,
-            "A_in",
-        )
-        Bu_in_it = make_ndarray_iterator(
-            Bu_in[g],
-            (0,),
-            iterators._iterators.IteratorIO.INPUT,
-            "Bu_in",
-        )
-        A_out_it = make_ndarray_iterator(
-            A_out[g],
-            (0,),
-            iterators._iterators.IteratorIO.OUTPUT,
-            "A_out",
-        )
-        Bu_out_it = make_ndarray_iterator(
-            Bu_out[g],
-            (0,),
-            iterators._iterators.IteratorIO.OUTPUT,
-            "Bu_out",
-        )
+        # -------- run cuda.parallel inclusive_scan using s5_op_separate ---------------
+        for g in range(G):
+            # Create iterators for this row
+            A_in_it = make_ndarray_iterator(
+                A_in[g],
+                (0,),
+                iterators._iterators.IteratorIO.INPUT,
+                "A_in",
+            )
+            Bu_in_it = make_ndarray_iterator(
+                Bu_in[g],
+                (0,),
+                iterators._iterators.IteratorIO.INPUT,
+                "Bu_in",
+            )
+            A_out_it = make_ndarray_iterator(
+                A_out[g],
+                (0,),
+                iterators._iterators.IteratorIO.OUTPUT,
+                "A_out",
+            )
+            Bu_out_it = make_ndarray_iterator(
+                Bu_out[g],
+                (0,),
+                iterators._iterators.IteratorIO.OUTPUT,
+                "Bu_out",
+            )
 
-        # Create zip iterators to handle (A, Bu) pairs
-        input_it = zip_iterator([A_in_it, Bu_in_it], "input")
-        output_it = zip_iterator([A_out_it, Bu_out_it], "output")
+            # Create zip iterators to handle (A, Bu) pairs
+            input_it = zip_iterator([A_in_it, Bu_in_it], "input")
+            output_it = zip_iterator([A_out_it, Bu_out_it], "output")
 
-        # Use CUDA parallel inclusive scan
-        scanner = algorithms.inclusive_scan(
-            input_it, output_it, s5_op_separate, init_val
-        )
+            # Use CUDA parallel inclusive scan
+            scanner = algorithms.inclusive_scan(
+                input_it, output_it, s5_op_separate, init_val
+            )
 
-        # Run the scan
-        tmp_sz = scanner(None, input_it, output_it, L, init_val)
-        tmp_buf = cp.empty((tmp_sz,), dtype=cp.uint8)
-        scanner(tmp_buf, input_it, output_it, L, init_val)
+            # Run the scan
+            tmp_sz = scanner(None, input_it, output_it, L, init_val)
+            tmp_buf = cp.empty((tmp_sz,), dtype=cp.uint8)
+            scanner(tmp_buf, input_it, output_it, L, init_val)
 
-    # ------------------------------------------------------------------
-    # 2.  After the scan, use the Bu component
-    # ------------------------------------------------------------------
-    Bu_scan_t = cupy_to_torch(Bu_out)  # Convert to torch tensor
+        # ------------------------------------------------------------------
+        # 2.  After the scan, use the Bu component
+        # ------------------------------------------------------------------
+        Bu_scan_t = cupy_to_torch(Bu_out)  # Convert to torch tensor
 
-    # reshape back to (B, D, L, N)
-    x_scan     = Bu_scan_t.reshape(Bsz, Dim, N, L).permute(0, 1, 3, 2)
-    last_state = x_scan[:, :, -1, :]
+        # reshape back to (B, D, L, N)
+        x_scan     = Bu_scan_t.reshape(Bsz, Dim, N, L).permute(0, 1, 3, 2)
+        last_state = x_scan[:, :, -1, :]
 
-    # -------- read‑out & residual path -------------------------------------
-    y_scan = torch.einsum("bdsn,bns->bds", x_scan, C)      # (B,D,L)
+        # -------- read‑out & residual path -------------------------------------
+        y_scan = torch.einsum("bdsn,bns->bds", x_scan, C)      # (B,D,L)
 
-    out = y_scan if D is None else y_scan + u * rearrange(D.float(), "d -> d 1")
-    if z is not None:
-        out = out * F.silu(z.float())
-    out = out.to(dtype_in)
+        out = y_scan if D is None else y_scan + u * rearrange(D.float(), "d -> d 1")
+        if z is not None:
+            out = out * F.silu(z.float())
+        out = out.to(dtype_in)
 
-    return (out, last_state) if return_last_state else out
+        return (out, last_state) if return_last_state else out
 
 
 class MambaInnerFn(torch.autograd.Function):
@@ -911,7 +914,7 @@ def mamba_inner_fn(
     b_rms_weight=None, c_rms_weight=None, dt_rms_weight=None,
     b_c_dt_rms_eps=1e-6
 ):
-    if SCAN_OPTION == "ref":
+    if SCAN_OPTION == "ref" or SCAN_OPTION == "ref-simple":
         return mamba_inner_ref(
             xz, conv1d_weight, conv1d_bias, x_proj_weight, delta_proj_weight,
             out_proj_weight, out_proj_bias,

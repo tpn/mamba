@@ -19,6 +19,10 @@ if SCAN_OPTION == "ref":
     print(f"Mamba using Python reference scan implementation")
     from mamba_ssm.ops.selective_scan_interface import selective_scan_ref as selective_scan_fn
     from mamba_ssm.ops.selective_scan_interface import mamba_inner_fn
+elif SCAN_OPTION == "ref-simple":
+    print(f"Mamba using Python simplified reference scan implementation")
+    from mamba_ssm.ops.selective_scan_interface import selective_scan_ref_simple as selective_scan_fn
+    from mamba_ssm.ops.selective_scan_interface import mamba_inner_fn
 elif SCAN_OPTION == "torch":
     print(f"Mamba using PyTorch associative scan wrapper implementation")
     from mamba_ssm.ops.selective_scan_interface import selective_scan_torch as selective_scan_fn

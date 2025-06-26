@@ -3,4 +3,6 @@
 build/
 **.so
 *.hip
-*_hip.*
+*_hip.**.txt
+*.nsys-rep
+*.sqlite

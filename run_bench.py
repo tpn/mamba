@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 
-try:
-    import cuda.parallel.experimental.algorithms
-    print('cuda.parallel.experimental.algorithms imported successfully')
-except ImportError:
-    print('Error! cuda.parallel.experimental.algorithms not found!')
+#try:
+#    import cuda.parallel.experimental.algorithms
+#    print('cuda.parallel.experimental.algorithms imported successfully')
+#except ImportError:
+#    print('Error! cuda.parallel.experimental.algorithms not found!')
 
 import argparse
 import datetime
@@ -68,11 +68,17 @@ def run_realtime(cmd, text_file):
         print(f"Command failed with return code {proc.returncode}")
         #raise subprocess.CalledProcessError(proc.returncode, cmd)
 
-def run_benchmark(scan, promptlen, genlen, batch, with_nsys=False):
+def run_benchmark(scan, promptlen, genlen, batch, with_nsys=False, with_ncu=False, ncu_launch_count=None, ncu_kernel=None):
     # Obtain a yyyy-mm-dd-hh-mm-ss timestamp using Python.
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
 
-    prefix = "nsys-mamba-bench" if with_nsys else "mamba-bench"
+    if with_nsys:
+        prefix = "nsys-mamba-bench"
+    elif with_ncu:
+        prefix = "ncu-mamba-bench"
+    else:
+        prefix = "mamba-bench"
+
     out = (f"{prefix}-{HOST}-{GPU_NAME}-{GPU_RAM}-"
            f"promptlen{promptlen}-genlen{genlen}-b{batch}-"
            f"scan-{scan}-{timestamp}")
@@ -89,6 +95,27 @@ def run_benchmark(scan, promptlen, genlen, batch, with_nsys=False):
             "--cuda-memory-usage=true",
             "--gpu-metrics-devices=cuda-visible",
         ])
+    elif with_ncu:
+        cmd.extend([
+            "ncu",
+            "--section", "ComputeWorkloadAnalysis",
+            "--section", "MemoryWorkloadAnalysis",
+            "--section", "InstructionStats",
+            "--section", "Occupancy",
+            "--section", "LaunchStats",
+            "--section", "SourceCounters",
+            "--section", "SchedulerStats",
+            "--section", "SpeedOfLight",
+            f"-o", f"{out}-%i",
+            "--import-source", "yes",
+            "--kernel-name-base", "demangled",
+        ])
+
+        if ncu_launch_count:
+            cmd.extend(["--launch-count", str(ncu_launch_count)])
+
+        if ncu_kernel:
+            cmd.extend(["-k", ncu_kernel])
 
     cmd.extend([
         "python", "benchmarks/benchmark_generation_mamba_simple.py",
@@ -119,6 +146,7 @@ SCAN_OPTIONS = [
     "cuda",
     "cuda2",
     "ref",
+    "ref-simple",
     "torch",
     "torch-cudaparallel",
     "cudaparallel",
@@ -136,14 +164,30 @@ def main():
                         help='Single or comma-separated list of generation lengths to benchmark')
     parser.add_argument('--batch', type=str, default='1',
                         help='Single or comma-separated list of batch sizes to benchmark')
-    parser.add_argument('--with-nsys', action='store_true',
+
+    # Profiling options
+    profiling_group = parser.add_mutually_exclusive_group()
+    profiling_group.add_argument('--with-nsys', action='store_true',
                         help='Run with Nsys profiling')
+    profiling_group.add_argument('--with-ncu', action='store_true',
+                        help='Run with Nvidia Compute Profiler (NCU)')
+
+    # NCU specific options
+    parser.add_argument('--ncu-launch-count', type=int, default=3,
+                        help=('Number of kernel launches to profile (NCU '
+                              'only, default: 3)'))
+    parser.add_argument('--ncu-kernel', type=str,
+                        default='regex:void selective_scan.*',
+                        help=('Kernel selection regex pattern (NCU only, '
+                              'default: "regex:void selective_scan.*")'))
+
     parser.add_argument("--scan", type=str, choices=SCAN_OPTIONS, default="cuda",
                         help=(
                             "Selective scan implementation to use:\n"
                             "   cuda (selective_scan_cuda),\n"
                             "   cuda2 (selective_scan2_cuda),\n"
                             "   ref (reference implementation),\n"
+                            "   ref-simple (simplified reference implementation),\n"
                             "   torch (pytorch associative scan wrapper),\n"
                             "   torch-cudaparallel (actual PyTorch associative scan),\n"
                             "   cudaparallel (cuda.parallel associative scan)\n"
@@ -163,7 +207,11 @@ def main():
     # Run benchmarks for all parameter combinations
     for scan, promptlen, genlen, batch in parameter_combinations:
         print(f"\nRunning benchmark with: scan={scan}, promptlen={promptlen}, genlen={genlen}, batch={batch}")
-        run_benchmark(scan, promptlen, genlen, batch, with_nsys=args.with_nsys)
+        run_benchmark(scan, promptlen, genlen, batch,
+                     with_nsys=args.with_nsys,
+                     with_ncu=args.with_ncu,
+                     ncu_launch_count=args.ncu_launch_count,
+                     ncu_kernel=args.ncu_kernel)
 
 if __name__ == "__main__":
     main()

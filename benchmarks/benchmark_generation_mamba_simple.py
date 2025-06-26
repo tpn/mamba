@@ -30,6 +30,7 @@ SCAN_OPTIONS = [
     "cuda",
     "cuda2",
     "ref",
+    "ref-simple",
     "torch",
     "torch-cudaparallel",
     "cudaparallel",
@@ -52,6 +53,7 @@ parser.add_argument("--scan", type=str, choices=SCAN_OPTIONS, default="cuda",
                         "   cuda (selective_scan_cuda),\n"
                         "   cuda2 (selective_scan2_cuda),\n"
                         "   ref (reference implementation),\n"
+                        "   ref-simple (simplified reference implementation),\n"
                         "   torch (pytorch associative scan wrapper),\n"
                         "   torch-cudaparallel (actual PyTorch associative scan),\n"
                         "   cudaparallel (cuda.parallel associative scan)\n"
